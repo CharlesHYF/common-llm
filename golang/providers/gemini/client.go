@@ -259,14 +259,14 @@ func (c *Client) Stream(ctx context.Context, request *core.ModelRequest) iter.Se
 
 // Supports 判断是否支持指定能力，未知能力返回 false。
 func (c *Client) Supports(feature string) bool {
-	return core.HasFeature(capabilityFeatures, feature)
+	return core.HasFeature(c.features(), feature)
 }
 
-// Capability 返回能力集合。
+// Capability 返回模型与图片生成能力集合。
 func (c *Client) Capability() core.ProviderCapability {
 	return core.ProviderCapability{
 		Provider: c.config.Name,
-		Features: slices.Clone(capabilityFeatures),
+		Features: c.features(),
 	}
 }
 

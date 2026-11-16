@@ -57,6 +57,7 @@ type clientSet struct {
 	config   *config.CommonLlmConfig
 	logger   *slog.Logger
 	models   map[string]core.ModelClient
+	images   map[string]core.ImageClient
 	agents   map[string]core.AgentClient
 	inFlight sync.WaitGroup
 }
@@ -101,6 +102,7 @@ func (c *CommonLlm) buildClients(ctx context.Context) (*clientSet, error) {
 		config: resolved,
 		logger: logger,
 		models: map[string]core.ModelClient{},
+		images: map[string]core.ImageClient{},
 		agents: map[string]core.AgentClient{},
 	}
 
@@ -111,11 +113,15 @@ func (c *CommonLlm) buildClients(ctx context.Context) (*clientSet, error) {
 
 		switch providerConfig.Type {
 		case config.ProviderTypeOpenAI:
-			clients.models[name] = openai.New(openai.Options{Config: providerConfig, Logger: logger, IDGenerator: c.options.IDGenerator})
+			client := openai.New(openai.Options{Config: providerConfig, Logger: logger, IDGenerator: c.options.IDGenerator})
+			clients.models[name] = client
+			clients.images[name] = client.Images()
 		case config.ProviderTypeAnthropic:
 			clients.models[name] = anthropic.New(anthropic.Options{Config: providerConfig, Logger: logger, IDGenerator: c.options.IDGenerator})
 		case config.ProviderTypeGemini:
-			clients.models[name] = gemini.New(gemini.Options{Config: providerConfig, Logger: logger, IDGenerator: c.options.IDGenerator})
+			client := gemini.New(gemini.Options{Config: providerConfig, Logger: logger, IDGenerator: c.options.IDGenerator})
+			clients.models[name] = client
+			clients.images[name] = client.Images()
 		}
 	}
 
@@ -226,6 +232,73 @@ func (s *clientSet) model(provider string) (core.ModelClient, error) {
 	}
 
 	return client, nil
+}
+
+// GenerateImage 按 request.provider 路由到对应 ImageClient 发起图片生成，失败返回 *Error。
+func (c *CommonLlm) GenerateImage(ctx context.Context, request *core.ImageRequest) (*core.ImageResponse, error) {
+	clients := c.acquire()
+	defer clients.inFlight.Done()
+
+	if request == nil {
+		return nil, core.NewError(core.CategoryConfigInvalid, "ImageRequest 不能为空", "")
+	}
+
+	client, err := clients.image(request.Provider)
+	if err != nil {
+		return nil, err
+	}
+
+	return client.Generate(ctx, request)
+}
+
+// StreamImage 按 request.provider 路由到对应 ImageClient 发起流式图片生成，失败（含 Provider 不支持）以唯一的 error 终止事件返回。
+func (c *CommonLlm) StreamImage(ctx context.Context, request *core.ImageRequest) iter.Seq[core.ImageEvent] {
+	return func(yield func(core.ImageEvent) bool) {
+		clients := c.acquire()
+		defer clients.inFlight.Done()
+
+		provider := ""
+		traceID := ""
+		if request != nil {
+			provider = request.Provider
+			traceID = request.TraceID
+		}
+
+		client, err := clients.image(provider)
+		if err != nil {
+			builder := core.NewImageEventBuilder(provider, core.ResolveTraceID(traceID, c.options.IDGenerator))
+			yield(builder.ErrorEvent(core.AsError(err, provider)))
+			return
+		}
+
+		for event := range client.Stream(ctx, request) {
+			if !yield(event) {
+				return
+			}
+		}
+	}
+}
+
+// Image 获取 Provider 实例的 ImageClient，Provider 不支持图片生成时报 SDK_UNSUPPORTED_FEATURE，未启用或未配置时报 CONFIG_INVALID。
+func (c *CommonLlm) Image(provider string) (core.ImageClient, error) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	return c.current.image(provider)
+}
+
+// image 查找 ImageClient，已启用但不支持图片生成的 Provider 报 SDK_UNSUPPORTED_FEATURE
+func (s *clientSet) image(provider string) (core.ImageClient, error) {
+	client, exists := s.images[provider]
+	if exists {
+		return client, nil
+	}
+
+	if _, isModel := s.models[provider]; isModel {
+		return nil, core.NewError(core.CategorySDKUnsupportedFeature, "Provider 不支持图片生成："+provider, provider)
+	}
+
+	return nil, core.NewError(core.CategoryConfigInvalid, "Provider 未启用或未配置："+provider, provider)
 }
 
 // ListProviders 返回已启用 Provider 的能力列表，按实例名排序。
