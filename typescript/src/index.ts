@@ -23,6 +23,8 @@ export {
 	classifyHttpStatus,
 	CommonLlmError,
 	createError,
+	createImageInputFromBytes,
+	createImageInputFromFile,
 	ERROR_CATEGORIES,
 	hasFeature,
 	isCommonLlmError,
@@ -30,6 +32,8 @@ export {
 	redactObject,
 	redactText,
 	REDACTED_VALUE,
+	serializeImageEvent,
+	serializeImageResponse,
 } from "./core/index.js";
 export {
 	createConsoleLogger,
@@ -38,12 +42,12 @@ export {
 	UUID_ID_GENERATOR,
 } from "./observability/index.js";
 export { AnthropicModelClient } from "./providers/anthropic/index.js";
-export { GeminiModelClient } from "./providers/gemini/index.js";
-export { OpenAiModelClient } from "./providers/openai/index.js";
+export { GeminiImageClient, GeminiModelClient } from "./providers/gemini/index.js";
+export { OpenAiImageClient, OpenAiModelClient } from "./providers/openai/index.js";
 export { VERSION } from "./version.js";
 
 export type { CommonLlmOptions } from "./common-llm.js";
 export type * from "./config/index.js";
 export type * from "./core/index.js";
 export type * from "./observability/index.js";
-export type { AgentClientOptions, ProviderClientOptions } from "./core/clients.js";
+export type { AgentClientOptions, ImageClient, ProviderClientOptions } from "./core/clients.js";

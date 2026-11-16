@@ -5,3 +5,4 @@
  */
 
 export { OpenAiModelClient } from "./openai-client.js";
+export { OpenAiImageClient } from "./openai-image-client.js";

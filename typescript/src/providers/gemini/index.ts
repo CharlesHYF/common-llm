@@ -5,3 +5,4 @@
  */
 
 export { GeminiModelClient } from "./gemini-client.js";
+export { GeminiImageClient } from "./gemini-image-client.js";

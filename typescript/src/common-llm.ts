@@ -12,15 +12,20 @@ import { createLeveledLogger, SILENT_LOGGER } from "./observability/logger.js";
 import { UUID_ID_GENERATOR } from "./observability/ids.js";
 import { AnthropicModelClient } from "./providers/anthropic/anthropic-client.js";
 import { GeminiModelClient } from "./providers/gemini/gemini-client.js";
+import { GeminiImageClient } from "./providers/gemini/gemini-image-client.js";
 import { OpenAiModelClient } from "./providers/openai/openai-client.js";
+import { OpenAiImageClient } from "./providers/openai/openai-image-client.js";
 
 import type { ConfigProvider } from "./config/config-provider.js";
 import type { CommonLlmConfig, CommonLlmConfigInput } from "./config/types.js";
-import type { AgentClient, ModelClient } from "./core/clients.js";
+import type { AgentClient, ImageClient, ModelClient } from "./core/clients.js";
 import type {
 	AgentCapability,
 	AgentName,
 	CallOptions,
+	ImageEvent,
+	ImageRequest,
+	ImageResponse,
 	ModelEvent,
 	ModelRequest,
 	ModelResponse,
@@ -45,6 +50,7 @@ export interface CommonLlmOptions {
 interface ClientGeneration {
 	config: CommonLlmConfig;
 	models: Map<string, ModelClient>;
+	images: Map<string, ImageClient>;
 	agents: Map<AgentName, AgentClient>;
 	activeCalls: number;
 	isRetired: boolean;
@@ -105,6 +111,34 @@ export class CommonLlm {
 		}
 	}
 
+	async generateImage(request: ImageRequest, options?: CallOptions): Promise<ImageResponse> {
+		const generation = this.generation;
+		const client = this.findImage(generation, request.provider);
+		generation.activeCalls += 1;
+
+		try {
+			return await client.generate(request, options);
+		} finally {
+			this.finishCall(generation);
+		}
+	}
+
+	async *streamImage(request: ImageRequest, options?: CallOptions): AsyncGenerator<ImageEvent> {
+		const generation = this.generation;
+		const client = this.findImage(generation, request.provider);
+		generation.activeCalls += 1;
+
+		try {
+			yield* client.stream(request, options);
+		} finally {
+			this.finishCall(generation);
+		}
+	}
+
+	image(provider: string): ImageClient {
+		return this.findImage(this.generation, provider);
+	}
+
 	model(provider: string): ModelClient {
 		return this.findModel(this.generation, provider);
 	}
@@ -124,8 +158,20 @@ export class CommonLlm {
 	listProviders(): ProviderCapability[] {
 		const capabilities: ProviderCapability[] = [];
 
-		for (const client of this.generation.models.values()) {
-			capabilities.push(client.capability());
+		for (const [name, client] of this.generation.models) {
+			const features = [
+				...client.capability().features,
+			];
+			const imageClient = this.generation.images.get(name);
+
+			for (const feature of imageClient?.capability().features ?? []) {
+				features.push(feature);
+			}
+
+			capabilities.push({
+				provider: name,
+				features,
+			});
 		}
 
 		return capabilities;
@@ -176,6 +222,7 @@ export class CommonLlm {
 		const logger = createLeveledLogger(baseLogger, config.common.log_level);
 		const idGenerator = this.options.idGenerator ?? UUID_ID_GENERATOR;
 		const models: Map<string, ModelClient> = new Map();
+		const images: Map<string, ImageClient> = new Map();
 		const agents: Map<AgentName, AgentClient> = new Map();
 
 		for (const [name, providerConfig] of Object.entries(config.providers)) {
@@ -190,12 +237,17 @@ export class CommonLlm {
 				idGenerator,
 			};
 
+			// 图片客户端复用同一实例的 SDK 客户端，Anthropic 没有图片生成能力
 			if (providerConfig.type === "openai") {
-				models.set(name, new OpenAiModelClient(clientOptions));
+				const modelClient = new OpenAiModelClient(clientOptions);
+				models.set(name, modelClient);
+				images.set(name, new OpenAiImageClient(clientOptions, modelClient.nativeClient()));
 			} else if (providerConfig.type === "anthropic") {
 				models.set(name, new AnthropicModelClient(clientOptions));
 			} else {
-				models.set(name, new GeminiModelClient(clientOptions));
+				const modelClient = new GeminiModelClient(clientOptions);
+				models.set(name, modelClient);
+				images.set(name, new GeminiImageClient(clientOptions, modelClient.nativeClient()));
 			}
 		}
 
@@ -220,6 +272,7 @@ export class CommonLlm {
 		return {
 			config,
 			models,
+			images,
 			agents,
 			activeCalls: 0,
 			isRetired: false,
@@ -238,6 +291,27 @@ export class CommonLlm {
 		return client;
 	}
 
+	/**
+	 * 未启用的实例报 CONFIG_INVALID，已启用但厂商不支持图片生成时报 SDK_UNSUPPORTED_FEATURE
+	 */
+	private findImage(generation: ClientGeneration, provider: string): ImageClient {
+		const client = generation.images.get(provider);
+
+		if (client) {
+			return client;
+		}
+
+		if (generation.models.has(provider)) {
+			throw createError("SDK_UNSUPPORTED_FEATURE", `Provider ${provider} 不支持图片生成`, {
+				provider,
+			});
+		}
+
+		throw createError("CONFIG_INVALID", `Provider ${provider} 未启用或未配置`, {
+			provider,
+		});
+	}
+
 	private finishCall(generation: ClientGeneration): void {
 		generation.activeCalls -= 1;
 
@@ -250,6 +324,10 @@ export class CommonLlm {
 		const closing: Promise<void>[] = [];
 
 		for (const client of generation.models.values()) {
+			closing.push(client.close());
+		}
+
+		for (const client of generation.images.values()) {
 			closing.push(client.close());
 		}
 
