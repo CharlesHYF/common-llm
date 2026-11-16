@@ -16,13 +16,27 @@ from common_llm.config.models import CommonLlmConfig
 from common_llm.core.agent_client import AgentClient, BaseAgentClient
 from common_llm.core.errors import CommonLlmError, ErrorCategory, build_error, build_error_info
 from common_llm.core.ids import IdFactory, resolve_trace_id
-from common_llm.core.model_client import ModelClient
+from common_llm.core.image_client import BaseImageClient, ImageClient, ImageEventSequencer
+from common_llm.core.model_client import BaseModelClient, ModelClient
 from common_llm.core.model_support import ModelEventSequencer
-from common_llm.core.types import AgentCapability, ModelErrorEvent, ModelEvent, ModelRequest, ModelResponse, ProviderCapability
+from common_llm.core.settings import ProviderSettings
+from common_llm.core.types import (
+    AgentCapability,
+    ImageEvent,
+    ImageRequest,
+    ImageResponse,
+    ModelErrorEvent,
+    ModelEvent,
+    ModelRequest,
+    ModelResponse,
+    ProviderCapability,
+)
 from common_llm.observability.logging import apply_log_level
 from common_llm.providers.anthropic.client import AnthropicModelClient
 from common_llm.providers.gemini.client import GeminiModelClient
+from common_llm.providers.gemini.images import GeminiImageClient
 from common_llm.providers.openai.client import create_openai_client
+from common_llm.providers.openai.images import OpenAiImagesClient, OpenAiResponsesImageClient
 
 
 class CommonLlm:
@@ -42,10 +56,8 @@ class CommonLlm:
         self._run_id_factory = run_id_factory
         self._trace_id_factory = trace_id_factory
         self._config = config
-        self._models: dict[str, ModelClient] = {}
-        self._agents: dict[str, AgentClient] = {}
         self._retire_tasks: set[asyncio.Task[None]] = set()
-        self._models, self._agents = self.build_clients(config)
+        self._models, self._images, self._agents = self.build_clients(config)
         apply_log_level(config.common.log_level)
 
     @classmethod
@@ -68,22 +80,29 @@ class CommonLlm:
     def config(self) -> CommonLlmConfig:
         return self._config
 
-    def build_clients(self, config: CommonLlmConfig) -> tuple[dict[str, ModelClient], dict[str, AgentClient]]:
+    def build_clients(self, config: CommonLlmConfig) -> tuple[dict[str, ModelClient], dict[str, ImageClient], dict[str, AgentClient]]:
         """
-        为已启用的 Provider 与 Agent 创建客户端
+        为已启用的 Provider 与 Agent 创建客户端，图片客户端复用同名模型客户端的 SDK 客户端
         """
         models: dict[str, ModelClient] = {}
+        images: dict[str, ImageClient] = {}
         for name, provider in config.providers.items():
             if not provider.enabled:
                 continue
 
             settings = build_provider_settings(config, name)
+            model_client: BaseModelClient
             if settings.provider_type == "openai":
-                models[name] = create_openai_client(settings, self._trace_id_factory)
+                model_client = create_openai_client(settings, self._trace_id_factory)
             elif settings.provider_type == "anthropic":
-                models[name] = AnthropicModelClient(settings, self._trace_id_factory)
+                model_client = AnthropicModelClient(settings, self._trace_id_factory)
             else:
-                models[name] = GeminiModelClient(settings, self._trace_id_factory)
+                model_client = GeminiModelClient(settings, self._trace_id_factory)
+
+            models[name] = model_client
+            image_client = self.build_image_client(settings, model_client)
+            if image_client is not None:
+                images[name] = image_client
 
         agents: dict[str, AgentClient] = {}
         for agent_name, agent in config.agents.items():
@@ -96,7 +115,22 @@ class CommonLlm:
             else:
                 agents[agent_name] = CodexAgentClient(agent_settings, run_id_factory=self._run_id_factory, trace_id_factory=self._trace_id_factory)
 
-        return models, agents
+        return models, images, agents
+
+    def build_image_client(self, settings: ProviderSettings, model_client: BaseModelClient) -> BaseImageClient | None:
+        """
+        OpenAI 按 image_api 选择路径，Gemini 使用 generateContent，Anthropic 不支持图片生成
+        """
+        if settings.provider_type == "openai" and settings.image_api == "responses":
+            return OpenAiResponsesImageClient(settings, model_client, self._trace_id_factory)
+
+        if settings.provider_type == "openai":
+            return OpenAiImagesClient(settings, model_client, self._trace_id_factory)
+
+        if settings.provider_type == "gemini":
+            return GeminiImageClient(settings, model_client, self._trace_id_factory)
+
+        return None
 
     def model(self, provider: str) -> ModelClient:
         """
@@ -107,6 +141,19 @@ class CommonLlm:
             raise build_error(ErrorCategory.CONFIG_INVALID, f"provider {provider} 未配置或未启用", provider=provider)
 
         return client
+
+    def image(self, provider: str) -> ImageClient:
+        """
+        获取 ImageClient，Provider 不支持图片生成时报 SDK_UNSUPPORTED_FEATURE，未启用或未配置时报 CONFIG_INVALID
+        """
+        client = self._images.get(provider)
+        if client is not None:
+            return client
+
+        if provider in self._models:
+            raise build_error(ErrorCategory.SDK_UNSUPPORTED_FEATURE, f"provider {provider} 不支持图片生成", provider=provider)
+
+        raise build_error(ErrorCategory.CONFIG_INVALID, f"provider {provider} 未配置或未启用", provider=provider)
 
     def agent(self, name: str) -> AgentClient:
         """
@@ -139,13 +186,39 @@ class CommonLlm:
         async for event in client.stream(request):
             yield event
 
+    async def generate_image(self, request: ImageRequest) -> ImageResponse:
+        """
+        按 request.provider 路由到对应 ImageClient 生成图片，失败时抛出 CommonLlmError
+        """
+        return await self.image(request.provider).generate(request)
+
+    async def stream_image(self, request: ImageRequest) -> AsyncIterator[ImageEvent]:
+        """
+        按 request.provider 路由到对应 ImageClient 流式生成图片，Provider 不可用时返回 error 事件
+        """
+        try:
+            client = self.image(request.provider)
+        except CommonLlmError as error:
+            trace_id = resolve_trace_id(request.trace_id, self._trace_id_factory)
+            yield ImageEventSequencer(request.provider, trace_id).error(error.info)
+            return
+
+        async for event in client.stream(request):
+            yield event
+
     def list_providers(self) -> list[ProviderCapability]:
         """
-        返回已启用 Provider 的能力
+        返回已启用 Provider 的能力，包含模型调用与图片生成两部分
         """
         capabilities: list[ProviderCapability] = []
-        for client in self._models.values():
-            capabilities.append(client.capability())
+        for name, client in self._models.items():
+            capability = client.capability()
+            image_client = self._images.get(name)
+            if image_client is not None:
+                for feature in image_client.capability().features:
+                    capability.features.append(feature)
+
+            capabilities.append(capability)
 
         return capabilities
 
@@ -169,18 +242,20 @@ class CommonLlm:
             info = build_error_info(ErrorCategory.CONFIG_INVALID, f"配置刷新失败，继续使用旧配置：{error.info.message}")
             raise CommonLlmError(info) from error
 
-        new_models, new_agents = self.build_clients(new_config)
+        new_models, new_images, new_agents = self.build_clients(new_config)
         old_models = self._models
+        old_images = self._images
         old_agents = self._agents
         self._config = new_config
         self._models = new_models
+        self._images = new_images
         self._agents = new_agents
         apply_log_level(new_config.common.log_level)
-        retire_task = asyncio.create_task(self.retire_clients(old_models, old_agents))
+        retire_task = asyncio.create_task(self.retire_clients(old_models, old_images, old_agents))
         self._retire_tasks.add(retire_task)
         retire_task.add_done_callback(self._retire_tasks.discard)
 
-    async def retire_clients(self, models: dict[str, ModelClient], agents: dict[str, AgentClient]) -> None:
+    async def retire_clients(self, models: dict[str, ModelClient], images: dict[str, ImageClient], agents: dict[str, AgentClient]) -> None:
         """
         等待旧客户端上进行中的请求与 run 结束后关闭
         """
@@ -189,6 +264,9 @@ class CommonLlm:
                 await agent_client.wait_until_idle()
 
             await agent_client.close()
+
+        for image_client in images.values():
+            await image_client.close()
 
         for model_client in models.values():
             await model_client.close()
@@ -203,6 +281,9 @@ class CommonLlm:
 
         for agent_client in self._agents.values():
             await agent_client.close()
+
+        for image_client in self._images.values():
+            await image_client.close()
 
         for model_client in self._models.values():
             await model_client.close()
