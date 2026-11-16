@@ -235,6 +235,9 @@ def validate_provider(name: str, provider: ProviderConfig, missing: Mapping[str,
     if provider.api != "responses" and provider_type != "openai":
         raise build_error(ErrorCategory.CONFIG_INVALID, f"providers.{name}.api 只适用于 type=openai")
 
+    if provider.image_api != "images" and provider_type != "openai":
+        raise build_error(ErrorCategory.CONFIG_INVALID, f"providers.{name}.image_api 只适用于 type=openai")
+
     if provider.enabled and not provider.api_key:
         hint = describe_missing(f"providers.{name}.api_key", missing)
         raise build_error(ErrorCategory.AUTH_MISSING, f"providers.{name}.api_key 为空{hint}", provider=name)
@@ -347,6 +350,10 @@ def build_provider_settings(config: CommonLlmConfig, name: str) -> ProviderSetti
         connect_timeout_seconds=common.connect_timeout_seconds,
         max_retries=max_retries,
         native_options=dict(provider.native_options),
+        default_image_model=provider.default_image_model,
+        image_api=provider.image_api,
+        image_concurrency=provider.image_concurrency,
+        image_timeout_seconds=provider.image_timeout_seconds,
     )
 
 

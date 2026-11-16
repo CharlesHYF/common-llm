@@ -5,7 +5,7 @@ Provider 与 Agent 适配层使用的运行参数，由配置模块转换得到
 修改日期：2026-11-16
 """
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Final
 
 from common_llm.core.redaction import MASK_TEXT
 
@@ -13,6 +13,8 @@ from common_llm.core.redaction import MASK_TEXT
 DEFAULT_TIMEOUT_SECONDS = 120.0
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_RETRIES = 2
+DEFAULT_IMAGE_API: Final = "images"
+DEFAULT_IMAGE_CONCURRENCY = 1
 DEFAULT_AGENT_TIMEOUT_SECONDS = 600.0
 DEFAULT_MAX_CONCURRENT_RUNS = 4
 DEFAULT_MAX_OUTPUT_BYTES = 10485760
@@ -39,6 +41,10 @@ class ProviderSettings:
     connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS
     max_retries: int = DEFAULT_MAX_RETRIES
     native_options: dict[str, Any] = field(default_factory=dict)
+    default_image_model: str | None = None
+    image_api: str = DEFAULT_IMAGE_API
+    image_concurrency: int = DEFAULT_IMAGE_CONCURRENCY
+    image_timeout_seconds: float | None = None
 
     def __repr__(self) -> str:
         masked_key = MASK_TEXT if self.api_key else None

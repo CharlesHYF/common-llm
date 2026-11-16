@@ -4,14 +4,18 @@
 创建日期：2026-11-16
 修改日期：2026-11-16
 """
+import base64 as base64_module
+import mimetypes
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import Field, SerializeAsAny
+from pydantic import Field, SerializeAsAny, field_serializer
 
 from common_llm.core.contract import ContractModel
-from common_llm.core.errors import ErrorInfo
+from common_llm.core.errors import ErrorCategory, ErrorInfo, build_error
 
 MessageRole = Literal["system", "user", "assistant", "tool"]
 FinishReason = Literal["stop", "length", "tool_calls", "content_filter", "other"]
@@ -477,3 +481,199 @@ class ApprovalRequest:
 
 
 ApprovalHandler = Callable[[ApprovalRequest], Awaitable[ApprovalDecision]]
+
+
+FEATURE_IMAGE_GENERATION = "image_generation"
+FEATURE_IMAGE_EDIT = "image_edit"
+FEATURE_IMAGE_MASK = "image_mask"
+FEATURE_IMAGE_STREAMING = "image_streaming"
+FEATURE_IMAGE_MULTIPLE = "image_multiple"
+# 文件头魔数与 MIME 类型的对应关系，用于从字节推断输入图片类型
+IMAGE_SIGNATURES = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
+
+
+def detect_image_mime_type(data: bytes) -> str | None:
+    """
+    按文件头魔数识别 PNG、JPEG、GIF、WebP，无法识别时返回 None
+    """
+    for signature, mime_type in IMAGE_SIGNATURES:
+        if data.startswith(signature):
+            return mime_type
+
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+
+    return None
+
+
+class ImageInput(ContractModel):
+    """
+    图片生成的输入图片或蒙版，base64 加 mime_type 与 url 二选一
+    """
+
+    base64: str | None = None
+    mime_type: str | None = None
+    url: str | None = None
+
+    @classmethod
+    def from_bytes(cls, data: bytes, mime_type: str | None = None) -> "ImageInput":
+        """
+        从图片字节创建，未指定 mime_type 时按文件头识别，无法识别时报 CONFIG_INVALID
+        """
+        resolved_mime_type = mime_type or detect_image_mime_type(data)
+        if resolved_mime_type is None:
+            raise build_error(ErrorCategory.CONFIG_INVALID, "无法识别输入图片的 MIME 类型，请显式指定 mime_type")
+
+        return cls(base64=base64_module.b64encode(data).decode("ascii"), mime_type=resolved_mime_type)
+
+    @classmethod
+    def from_file(cls, path: str | os.PathLike[str], mime_type: str | None = None) -> "ImageInput":
+        """
+        从图片文件创建，未指定 mime_type 时依次按文件头与扩展名识别
+        """
+        data = Path(path).read_bytes()
+        resolved_mime_type = mime_type or detect_image_mime_type(data) or mimetypes.guess_type(str(path))[0]
+        return cls.from_bytes(data, resolved_mime_type)
+
+
+class GeneratedImage(ContractModel):
+    """
+    生成的图片，data 为图片字节，序列化为契约 JSON 时输出 base64
+    """
+
+    data: bytes
+    mime_type: str
+    url: str | None = None
+    revised_prompt: str | None = None
+
+    @field_serializer("data", when_used="json")
+    def serialize_data(self, data: bytes) -> str:
+        return base64_module.b64encode(data).decode("ascii")
+
+    def save(self, path: str | os.PathLike[str]) -> None:
+        """
+        把图片字节写入文件
+        """
+        Path(path).write_bytes(self.data)
+
+
+class ImageRequest(ContractModel):
+    """
+    统一的图片生成请求，images 有值时为图生图
+    """
+
+    provider: str
+    model: str | None = None
+    prompt: str
+    images: list[ImageInput] | None = None
+    mask: ImageInput | None = None
+    n: int | None = None
+    size: str | None = None
+    aspect_ratio: str | None = None
+    image_size: str | None = None
+    quality: str | None = None
+    output_format: str | None = None
+    output_compression: int | None = None
+    background: str | None = None
+    partial_images: int | None = None
+    provider_options: dict[str, Any] | None = None
+    timeout_seconds: float | None = None
+    include_raw_response: bool | None = None
+    trace_id: str | None = None
+    request_id: str | None = None
+    metadata: dict[str, str] | None = None
+
+
+class ImageResponse(ContractModel):
+    """
+    统一的图片生成响应
+    """
+
+    provider: str
+    model: str | None = None
+    id: str | None = None
+    images: list[GeneratedImage]
+    text: str
+    usage: Usage
+    trace_id: str
+    request_id: str | None = None
+    raw_response: dict[str, Any] | list[Any] | None = None
+
+
+class ImageEvent(ContractModel):
+    """
+    流式图片生成事件基类
+    """
+
+    type: str
+    trace_id: str
+    sequence: int
+    provider: str
+
+
+class ImageStartedEvent(ImageEvent):
+    """
+    流的第一个事件
+    """
+
+    type: Literal["started"] = "started"
+    model: str | None = None
+    id: str | None = None
+
+
+class ImagePartialEvent(ImageEvent):
+    """
+    厂商返回的部分图片
+    """
+
+    type: Literal["partial_image"] = "partial_image"
+    image_index: int
+    partial_index: int
+    data: bytes
+    mime_type: str
+
+    @field_serializer("data", when_used="json")
+    def serialize_data(self, data: bytes) -> str:
+        return base64_module.b64encode(data).decode("ascii")
+
+
+class ImageGeneratedEvent(ImageEvent):
+    """
+    单张图片生成完成
+    """
+
+    type: Literal["image_completed"] = "image_completed"
+    image_index: int
+    image: GeneratedImage
+
+
+class ImageUsageEvent(ImageEvent):
+    """
+    用量事件，紧挨在 completed 之前
+    """
+
+    type: Literal["usage"] = "usage"
+    usage: Usage
+
+
+class ImageCompletedEvent(ImageEvent):
+    """
+    成功终止事件
+    """
+
+    type: Literal["completed"] = "completed"
+    response: ImageResponse
+
+
+class ImageErrorEvent(ImageEvent):
+    """
+    失败终止事件
+    """
+
+    type: Literal["error"] = "error"
+    error: ErrorInfo

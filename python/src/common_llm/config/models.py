@@ -12,6 +12,8 @@ from common_llm.core.redaction import MASK_TEXT, redact_mapping
 from common_llm.core.settings import (
     DEFAULT_AGENT_TIMEOUT_SECONDS,
     DEFAULT_CONNECT_TIMEOUT_SECONDS,
+    DEFAULT_IMAGE_API,
+    DEFAULT_IMAGE_CONCURRENCY,
     DEFAULT_KILL_GRACE_SECONDS,
     DEFAULT_MAX_BUFFERED_EVENTS,
     DEFAULT_MAX_CONCURRENT_RUNS,
@@ -72,6 +74,10 @@ class ProviderConfig(ConfigSection):
     timeout_seconds: float | None = Field(default=None, gt=0)
     max_retries: int | None = Field(default=None, ge=0)
     native_options: dict[str, Any] = Field(default_factory=dict)
+    default_image_model: str | None = None
+    image_api: Literal["images", "responses"] = DEFAULT_IMAGE_API
+    image_concurrency: int = Field(default=DEFAULT_IMAGE_CONCURRENCY, ge=1)
+    image_timeout_seconds: float | None = Field(default=None, gt=0)
 
 
 class AgentConfig(ConfigSection):

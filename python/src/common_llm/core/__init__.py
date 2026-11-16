@@ -6,6 +6,7 @@ core 模块入口，导出契约类型、错误与客户端接口
 """
 from common_llm.core.agent_client import AgentClient
 from common_llm.core.errors import CommonLlmError, ErrorCategory, ErrorInfo
+from common_llm.core.image_client import ImageClient
 from common_llm.core.model_client import ModelClient
 from common_llm.core.settings import AgentSettings, ProviderSettings
 from common_llm.core.types import (
@@ -30,7 +31,18 @@ from common_llm.core.types import (
     ApprovalRequest,
     ContentPart,
     FileChange,
+    GeneratedImage,
+    ImageCompletedEvent,
+    ImageErrorEvent,
+    ImageEvent,
+    ImageGeneratedEvent,
+    ImageInput,
     ImagePart,
+    ImagePartialEvent,
+    ImageRequest,
+    ImageResponse,
+    ImageStartedEvent,
+    ImageUsageEvent,
     Message,
     ModelCompletedEvent,
     ModelErrorEvent,
@@ -79,7 +91,19 @@ __all__ = [
     "ErrorCategory",
     "ErrorInfo",
     "FileChange",
+    "GeneratedImage",
+    "ImageClient",
+    "ImageCompletedEvent",
+    "ImageErrorEvent",
+    "ImageEvent",
+    "ImageGeneratedEvent",
+    "ImageInput",
     "ImagePart",
+    "ImagePartialEvent",
+    "ImageRequest",
+    "ImageResponse",
+    "ImageStartedEvent",
+    "ImageUsageEvent",
     "Message",
     "ModelClient",
     "ModelCompletedEvent",
