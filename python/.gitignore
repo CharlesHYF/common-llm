@@ -1,0 +1,13 @@
+# 真实配置文件可能含密钥
+common-llm.yaml
+common-llm.json
+
+# Python 构建与缓存
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
