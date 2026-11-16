@@ -14,6 +14,7 @@ common-llm for Go 把三家模型 API 与两个 Coding Agent 封装成统一的 
 
 ## 特性
 - 模型 API：OpenAI（Responses API 与 Chat Completions）、Anthropic（Messages API）、Gemini（generateContent），支持非流式、流式、工具调用、结构化输出、图片输入与厂商原生参数透传。
+- 图片生成：OpenAI（Images API 与 Responses API `image_generation` 工具两条路径，可配置）与 Gemini（`generateContent` 原生出图），支持文生图、图生图、蒙版、流式部分图片与多张生成。
 - Coding Agent：Claude Code（`claude -p` stream-json）与 Codex（`codex app-server` JSON-RPC），支持 run、流式事件、resume、interrupt，Codex 支持审批处理器。
 - 配置：YAML / JSON 文件、`${ENV}` 引用、运行时覆盖、可注入的 `ConfigProvider`（例如数据库），按字段合并，`Reload` 失败时保留旧配置。
 - 错误分类：19 个统一分类，携带是否可重试、HTTP 状态码、厂商错误码与请求 ID，可用 `errors.As` 提取。
@@ -306,6 +307,133 @@ for _, provider := range []string{"openai", "deepseek", "local_vllm"} {
 }
 ```
 
+### 图片生成
+在 Provider 实例上配置图片模型 `default_image_model`；OpenAI 用 `image_api` 选择 `images`（默认，Images API）或 `responses`（Responses API 的 `image_generation` 工具，`default_model` 作为对话模型）。Anthropic 没有图片生成能力，调用时报 `SDK_UNSUPPORTED_FEATURE`：
+```yaml
+providers:
+  openai:
+    enabled: true
+    api_key: ${OPENAI_API_KEY}
+    default_model: ${OPENAI_MODEL}
+    default_image_model: ${OPENAI_IMAGE_MODEL}
+    image_api: images
+  gemini:
+    enabled: true
+    api_key: ${GEMINI_API_KEY}
+    default_image_model: ${GEMINI_IMAGE_MODEL}
+```
+
+文生图。`GenerateImage` 失败返回 `*commonllm.Error`；`GeneratedImage.Data` 为图片字节，`MimeType` 为其类型：
+```go
+response, err := client.GenerateImage(ctx, &core.ImageRequest{
+	Provider:     "openai",
+	Prompt:       "一只橘猫坐在窗台上，水彩风格",
+	Size:         "1024x1024",
+	Quality:      "low",
+	OutputFormat: "png",
+})
+if err != nil {
+	return err
+}
+
+for index, image := range response.Images {
+	fileName := fmt.Sprintf("cat-%d.%s", index, strings.TrimPrefix(image.MimeType, "image/"))
+	if err := os.WriteFile(fileName, image.Data, 0o644); err != nil {
+		return err
+	}
+
+	if image.RevisedPrompt != nil {
+		fmt.Println("revisedPrompt:", *image.RevisedPrompt)
+	}
+}
+```
+
+图生图与蒙版。`Images` 有值即图生图（OpenAI Images 路径调用 `images.edit`，超过 16 张报 `CONFIG_INVALID`）；`Mask` 只支持 OpenAI，且需要同时提供 `Images`。输入图片可由字节、文件路径或 URL（仅 OpenAI Responses 路径）构造，无法识别 MIME 类型时报 `CONFIG_INVALID`：
+```go
+photo, err := core.ImageFromFile("photo.png")
+if err != nil {
+	return err
+}
+
+mask, err := core.ImageFromFile("mask.png")
+if err != nil {
+	return err
+}
+
+logoBytes, err := os.ReadFile("logo.png")
+if err != nil {
+	return err
+}
+
+logo := core.ImageFromBytes(logoBytes, "image/png")
+
+response, err := client.GenerateImage(ctx, &core.ImageRequest{
+	Provider: "openai",
+	Prompt:   "把窗外换成雪景，并在右下角放上 logo",
+	Images:   []core.ImageInput{photo, logo},
+	Mask:     &mask,
+})
+if err != nil {
+	return err
+}
+
+fmt.Println(len(response.Images))
+```
+
+流式输出。`StreamImage` 返回 `iter.Seq[core.ImageEvent]`，不返回 error，失败以唯一的 `error` 终止事件结束；`PartialImages` 只用于流式（非流式 `GenerateImage` 设置该字段，含 0，报 `SDK_UNSUPPORTED_FEATURE`），OpenAI 两条路径支持 0 到 3 张部分图片；`usage` 事件只在厂商返回过用量时发出，流式不提供 `RawResponse`：
+```go
+partialImages := 2
+
+for event := range client.StreamImage(ctx, &core.ImageRequest{
+	Provider:      "openai",
+	Prompt:        "城市夜景，赛博朋克风格",
+	PartialImages: &partialImages,
+}) {
+	switch event.Type {
+	case core.ImageEventPartialImage:
+		fmt.Println("部分图片", event.ImageIndex, event.PartialIndex, len(event.Data))
+	case core.ImageEventImageCompleted:
+		fmt.Println("图片完成", event.ImageIndex, event.Image.MimeType)
+	case core.ImageEventError:
+		return fmt.Errorf("图片生成失败：%s %s", event.Error.Category, event.Error.Message)
+	case core.ImageEventCompleted:
+		fmt.Println("共", len(event.Response.Images), "张")
+	}
+}
+```
+
+多张生成。OpenAI Images 路径原生支持 `N`（1 到 10，一次请求，超过 10 报 `CONFIG_INVALID`）；OpenAI Responses 路径与 Gemini 在库内循环 `N` 次，并发数由 `image_concurrency` 控制（默认 1，串行）。任一次失败则整个调用失败并返回该次错误，已生成的图片不返回，未开始的请求不再发出，进行中的请求取消；结果按调用顺序排列，用量逐项求和，`ID` 与 `RequestID` 取最后一次，`IncludeRawResponse` 时 `RawResponse` 为各次原始响应组成的 JSON 数组。流式时按顺序逐次请求，`ImageIndex` 区分第几张：
+```go
+count := 3
+
+response, err := client.GenerateImage(ctx, &core.ImageRequest{
+	Provider:    "gemini",
+	Prompt:      "极简风格的山脉插画",
+	N:           &count,
+	AspectRatio: "16:9",
+	ImageSize:   "2K",
+})
+if err != nil {
+	return err
+}
+
+fmt.Println(len(response.Images), response.Text)
+```
+
+各路径支持的参数（请求了所选路径不支持的字段一律报 `SDK_UNSUPPORTED_FEATURE`，不静默忽略）：
+
+| 参数 | OpenAI Images | OpenAI Responses | Gemini |
+|---|---|---|---|
+| `Images`（图生图） | 支持，最多 16 张，不支持 URL | 支持，含 URL | 支持，不支持 URL |
+| `Mask` | 支持 | 支持（`input_image_mask`） | 不支持 |
+| `N` | 原生 | 库内循环 | 库内循环 |
+| `Size`、`Quality`、`OutputFormat`、`OutputCompression`、`Background` | 支持 | 支持（工具参数） | 不支持 |
+| `AspectRatio`、`ImageSize` | 不支持 | 不支持 | 支持（`imageConfig`） |
+| `PartialImages`（仅流式） | 支持 | 支持 | 不支持 |
+| `ProviderOptions` | 经 `SetExtraFields` 透传 | 经 `option.WithJSONSet` 透传 | 经 `HTTPOptions.ExtraBody` 透传 |
+
+图片请求只透传请求级 `ProviderOptions`，不附加配置中的 `native_options`。Responses 路径的多轮修改可通过 `ProviderOptions` 传入 `previous_response_id`。能力可用 `client.Image(provider)` 取得 `ImageClient` 后查询：`Supports(core.FeatureImageMask)` 等，能力名为 `image_generation`、`image_edit`、`image_mask`、`image_streaming`、`image_multiple`。
+
 ### Coding Agent
 在配置中启用 Agent：
 ```yaml
@@ -498,6 +626,10 @@ fmt.Println(len(models.Data))
 | `providers.<实例名>.default_model` | 无 | 请求未指定 `Model` 时使用 |
 | `providers.<实例名>.timeout_seconds` / `max_retries` | 继承 `common` | |
 | `providers.<实例名>.native_options` | `{}` | 每次请求附加的原生参数；Anthropic 的 `max_tokens` 作为 `MaxOutputTokens` 的默认值 |
+| `providers.<实例名>.default_image_model` | 无 | 图片模型，请求未指定 `Model` 时使用，两者都没有报 `CONFIG_INVALID` |
+| `providers.<实例名>.image_api` | `images` | 仅 `type: openai`：`images` / `responses` |
+| `providers.<实例名>.image_concurrency` | `1` | 库内循环生成多张时的并发数，不能小于 1 |
+| `providers.<实例名>.image_timeout_seconds` | 继承本实例 `timeout_seconds` | 图片生成单次请求超时 |
 | `agents.<claude_code\|codex>.enabled` | `false` | |
 | `agents.*.auth_mode` | `cli_existing_session` | `api_key` / `cli_existing_session` / `vendor_supported` |
 | `agents.*.api_key` | 无 | `auth_mode: api_key` 时必填 |
@@ -529,7 +661,7 @@ fmt.Println(len(models.Data))
 第三方产品不得复用用户的个人订阅登录（Claude.ai、ChatGPT 订阅），对外提供服务时请使用 API key；Claude Agent 按 Anthropic Commercial Terms 使用 API key。真实的 `common-llm.yaml` 与 `common-llm.json` 已在本目录 `.gitignore` 中忽略。
 
 ## 错误处理
-`Generate`、`Model`、`Agent`、`Interrupt`、`Capabilities`、`Reload` 返回 `error`，类型为 `*commonllm.Error`（即 `*core.Error`），`Info` 字段为跨语言统一的 `ErrorInfo`：
+`Generate`、`GenerateImage`、`Model`、`Image`、`Agent`、`Interrupt`、`Capabilities`、`Reload` 返回 `error`，类型为 `*commonllm.Error`（即 `*core.Error`），`Info` 字段为跨语言统一的 `ErrorInfo`：
 ```go
 _, err := client.Generate(ctx, &core.ModelRequest{
 	Provider: "openai",
@@ -550,7 +682,7 @@ if errors.As(err, &commonErr) {
 }
 ```
 
-`Stream`、`Run`、`RunStream` 不返回 error：`Stream` 以唯一的 `error` 终止事件结束（`event.Error`），`Run` 返回 `Status = failed` 且 `Error` 非空的结果，`RunStream` 以唯一的 `failed` 终止事件结束，取消时为 `cancelled`。预检失败（Provider 不存在、配置非法、CLI 不存在、工作目录非法）同样按此返回。错误消息与 `cause` 已脱敏，不含 key、token 与 prompt 正文。
+`Stream`、`StreamImage`、`Run`、`RunStream` 不返回 error：`Stream` 与 `StreamImage` 以唯一的 `error` 终止事件结束（`event.Error`），`Run` 返回 `Status = failed` 且 `Error` 非空的结果，`RunStream` 以唯一的 `failed` 终止事件结束，取消时为 `cancelled`。预检失败（Provider 不存在、配置非法、CLI 不存在、工作目录非法）同样按此返回。错误消息与 `cause` 已脱敏，不含 key、token 与 prompt 正文。
 
 | category | 触发条件 | 可重试 |
 |---|---|---|
@@ -574,6 +706,8 @@ if errors.As(err, &commonErr) {
 | `SANDBOX_DENIED` | 沙箱拒绝的操作导致 run 失败 | 否 |
 | `INTERNAL_ERROR` | 本库自身缺陷 | 否 |
 
+图片生成补充：OpenAI 内容审核拒绝（如 `moderation_blocked`）为 `PROVIDER_ERROR`，不可重试，`vendorCode` 为厂商错误码；Gemini 响应中没有图片（如 `finishReason` 为 `IMAGE_SAFETY`）为 `PROVIDER_ERROR`，`vendorCode` 为 finishReason；对 Anthropic 调用图片生成或请求了路径不支持的字段为 `SDK_UNSUPPORTED_FEATURE`；输入图片无法识别 MIME 类型为 `CONFIG_INVALID`。
+
 ## 依赖版本
 与本目录 `go.mod` 一致，间接依赖以 `go.sum` 为准：
 
@@ -596,6 +730,8 @@ if errors.As(err, &commonErr) {
 - Anthropic 已弃用 temperature（anthropic-sdk-go v2.9.0 的 `MessageNewParams` 已移除该字段）：请求 `Temperature` 非空时报 `SDK_UNSUPPORTED_FEATURE`，确需传递时写入 `ProviderOptions`（例如 `{"temperature": 0.2}`）。
 - Gemini Go SDK 的用量字段是带 `omitempty` 的整数，无法区分 0 与缺失：`cachedInputTokens`、`reasoningTokens` 为 0 时返回 `nil`。
 - Gemini 没有请求 ID，`RequestID` 为 `nil`；`IncludeRawResponse` 返回的是 SDK 响应结构重新序列化的 JSON，不是原始响应体。
+- Gemini 图片生成不支持蒙版、部分图片、`Size`、`Quality`、`OutputFormat`、`OutputCompression`、`Background` 与 URL 输入图片，也不支持原生多张（库内循环）；只提供 `AspectRatio` 与 `ImageSize`。OpenAI 两条路径不支持 `AspectRatio` 与 `ImageSize`；Images 路径不支持 URL 输入图片。
+- 图片生成的库内循环在流式时按顺序逐次请求，不使用 `image_concurrency` 并发。
 - openai-go 创建客户端时会读取 `OPENAI_ORG_ID`、`OPENAI_PROJECT_ID`、`OPENAI_CUSTOM_HEADERS` 等环境变量；`api_key` 与 `base_url` 以配置为准。
 
 ## 示例
@@ -607,6 +743,7 @@ if errors.As(err, &commonErr) {
 | `streaming` | 流式生成，逐段输出文本增量 | `go run ./examples/streaming` |
 | `coding-agent` | 调用 Codex 执行任务，审批处理器只批准只读命令 | `go run ./examples/coding-agent` |
 | `config-switch` | 运行时覆盖配置，同时启用官方 OpenAI 与 OpenAI 兼容端点并切换调用 | `go run ./examples/config-switch` |
+| `image-generation` | 文生图并把生成的图片保存到当前目录 | `go run ./examples/image-generation` |
 | `database-config-provider` | 把配置表映射为 `ConfigProvider`（`database/sql` 实现与内存实现），演示 `Reload` | `go run ./examples/database-config-provider` |
 
 ## 许可证

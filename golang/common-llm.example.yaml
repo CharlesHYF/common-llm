@@ -13,6 +13,11 @@ providers:
     api_key: ${OPENAI_API_KEY}
     base_url: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
     default_model: ${OPENAI_MODEL}
+    # 图片生成：image_api 为 images（Images API）或 responses（Responses API image_generation 工具）
+    default_image_model: ${OPENAI_IMAGE_MODEL}
+    image_api: images
+    image_concurrency: 1
+    image_timeout_seconds: 300
   anthropic:
     enabled: true
     api_key: ${ANTHROPIC_API_KEY}
@@ -23,6 +28,7 @@ providers:
     enabled: true
     api_key: ${GEMINI_API_KEY}
     default_model: ${GEMINI_MODEL}
+    default_image_model: ${GEMINI_IMAGE_MODEL}
   local_vllm:
     type: openai
     api: chat_completions
