@@ -25,6 +25,12 @@ const (
 	OpenAIAPIChatCompletions = "chat_completions"
 )
 
+// OpenAI 图片生成路径
+const (
+	ImageAPIImages    = "images"
+	ImageAPIResponses = "responses"
+)
+
 // Agent 认证方式
 const (
 	AuthModeAPIKey             = "api_key"
@@ -71,6 +77,8 @@ const (
 	DefaultCodexExecutable        = "codex"
 	DefaultAuthMode               = AuthModeCLIExistingSession
 	DefaultOpenAIAPI              = OpenAIAPIResponses
+	DefaultImageAPI               = ImageAPIImages
+	DefaultImageConcurrency       = 1
 	DefaultConfigFileName         = "common-llm.yaml"
 	ConfigPathEnvironmentVariable = "COMMON_LLM_CONFIG"
 )
@@ -103,6 +111,10 @@ type ProviderConfig struct {
 	ConnectTimeoutSeconds float64
 	MaxRetries            int
 	NativeOptions         map[string]any
+	DefaultImageModel     string
+	ImageAPI              string
+	ImageConcurrency      int
+	ImageTimeoutSeconds   float64
 }
 
 // AgentConfig 单个 Coding Agent 的配置。

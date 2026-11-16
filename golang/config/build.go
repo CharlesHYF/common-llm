@@ -40,6 +40,11 @@ type providerDocument struct {
 	TimeoutSeconds *float64       `json:"timeout_seconds"`
 	MaxRetries     *int           `json:"max_retries"`
 	NativeOptions  map[string]any `json:"native_options"`
+	// 图片生成相关字段
+	DefaultImageModel   *string  `json:"default_image_model"`
+	ImageAPI            *string  `json:"image_api"`
+	ImageConcurrency    *int     `json:"image_concurrency"`
+	ImageTimeoutSeconds *float64 `json:"image_timeout_seconds"`
 }
 
 // agentsDocument agents 节点，只允许 claude_code 与 codex
@@ -77,6 +82,7 @@ var (
 	validLogLevels     = []string{LogLevelDebug, LogLevelInfo, LogLevelWarn, LogLevelError}
 	validProviderTypes = []string{ProviderTypeOpenAI, ProviderTypeAnthropic, ProviderTypeGemini}
 	validOpenAIAPIs    = []string{OpenAIAPIResponses, OpenAIAPIChatCompletions}
+	validImageAPIs     = []string{ImageAPIImages, ImageAPIResponses}
 	validAuthModes     = []string{AuthModeAPIKey, AuthModeCLIExistingSession, AuthModeVendorSupported}
 	validSandboxModes  = []string{SandboxReadOnly, SandboxWorkspaceWrite, SandboxDangerFullAccess}
 )
@@ -196,7 +202,13 @@ func buildProvider(name string, node *providerDocument, common CommonConfig, mis
 		ConnectTimeoutSeconds: common.ConnectTimeoutSeconds,
 		MaxRetries:            valueOrInt(node.MaxRetries, common.MaxRetries),
 		NativeOptions:         copyOptions(node.NativeOptions),
+		DefaultImageModel:     valueOrString(node.DefaultImageModel, ""),
+		ImageAPI:              valueOrString(node.ImageAPI, DefaultImageAPI),
+		ImageConcurrency:      valueOrInt(node.ImageConcurrency, DefaultImageConcurrency),
 	}
+
+	// image_timeout_seconds 未设置时继承本实例的 timeout_seconds
+	provider.ImageTimeoutSeconds = valueOrFloat(node.ImageTimeoutSeconds, provider.TimeoutSeconds)
 
 	if provider.Type == "" {
 		if !slices.Contains(validProviderTypes, name) {
@@ -216,6 +228,22 @@ func buildProvider(name string, node *providerDocument, common CommonConfig, mis
 
 	if !slices.Contains(validOpenAIAPIs, provider.API) {
 		return provider, invalidField(path + ".api 取值非法：" + provider.API)
+	}
+
+	if node.ImageAPI != nil && provider.Type != ProviderTypeOpenAI {
+		return provider, invalidField(path + ".image_api 只适用于 type=openai")
+	}
+
+	if !slices.Contains(validImageAPIs, provider.ImageAPI) {
+		return provider, invalidField(path + ".image_api 取值非法：" + provider.ImageAPI)
+	}
+
+	if provider.ImageConcurrency < 1 {
+		return provider, invalidField(path + ".image_concurrency 不能小于 1")
+	}
+
+	if provider.ImageTimeoutSeconds <= 0 {
+		return provider, invalidField(path + ".image_timeout_seconds 必须大于 0")
 	}
 
 	if provider.TimeoutSeconds <= 0 {
