@@ -1,5 +1,7 @@
 package io.github.charleshyf.commonllm;
 
+import com.google.genai.Client;
+import com.openai.client.OpenAIClient;
 import io.github.charleshyf.commonllm.agents.claudecode.ClaudeCodeAgentClient;
 import io.github.charleshyf.commonllm.agents.codex.CodexAgentClient;
 import io.github.charleshyf.commonllm.config.AgentConfig;
@@ -19,13 +21,19 @@ import io.github.charleshyf.commonllm.core.BufferedAgentStream;
 import io.github.charleshyf.commonllm.core.CommonLlmException;
 import io.github.charleshyf.commonllm.core.ErrorCategory;
 import io.github.charleshyf.commonllm.core.ErrorInfo;
+import io.github.charleshyf.commonllm.core.ImageClient;
+import io.github.charleshyf.commonllm.core.ImageRequest;
+import io.github.charleshyf.commonllm.core.ImageResponse;
+import io.github.charleshyf.commonllm.core.ImageStream;
 import io.github.charleshyf.commonllm.core.ModelClient;
 import io.github.charleshyf.commonllm.core.ModelRequest;
 import io.github.charleshyf.commonllm.core.ModelResponse;
 import io.github.charleshyf.commonllm.core.ModelStream;
 import io.github.charleshyf.commonllm.core.ProviderCapability;
 import io.github.charleshyf.commonllm.providers.anthropic.AnthropicModelClient;
+import io.github.charleshyf.commonllm.providers.gemini.GeminiImageClient;
 import io.github.charleshyf.commonllm.providers.gemini.GeminiModelClient;
+import io.github.charleshyf.commonllm.providers.openai.OpenAiImageClient;
 import io.github.charleshyf.commonllm.providers.openai.OpenAiModelClient;
 
 import java.nio.file.Files;
@@ -109,6 +117,46 @@ public final class CommonLlm implements AutoCloseable {
 		return currentGeneration().getModelClient(provider);
 	}
 
+	/**
+	 * 同步生成图片，失败时抛出 CommonLlmException；Anthropic 等不支持图片生成的 Provider 报 SDK_UNSUPPORTED_FEATURE
+	 */
+	public ImageResponse generateImage(ImageRequest request) {
+		ClientGeneration generation = acquireGeneration();
+
+		try {
+			return generation.getImageClient(request.getProvider()).generate(request);
+		} finally {
+			generation.release();
+		}
+	}
+
+	/**
+	 * 流式生成图片，不抛异常：预检失败以 error 事件结束；流关闭后才允许 reload 释放旧客户端
+	 */
+	public ImageStream streamImage(ImageRequest request) {
+		ClientGeneration generation;
+
+		try {
+			generation = acquireGeneration();
+		} catch (CommonLlmException exception) {
+			return ImageStream.failed(resolveTraceId(request.getTraceId()), request.getProvider(), exception.getErrorInfo());
+		}
+
+		try {
+			return generation.getImageClient(request.getProvider()).stream(request).onClose(generation::release);
+		} catch (CommonLlmException exception) {
+			generation.release();
+			return ImageStream.failed(resolveTraceId(request.getTraceId()), request.getProvider(), exception.getErrorInfo());
+		}
+	}
+
+	/**
+	 * 获取图片生成客户端；未启用报 CONFIG_INVALID，Provider 不支持图片生成报 SDK_UNSUPPORTED_FEATURE
+	 */
+	public ImageClient image(String provider) {
+		return currentGeneration().getImageClient(provider);
+	}
+
 	public AgentClient agent(String agent) {
 		return currentGeneration().getAgentClient(agent);
 	}
@@ -170,8 +218,20 @@ public final class CommonLlm implements AutoCloseable {
 	public List<ProviderCapability> listProviders() {
 		List<ProviderCapability> capabilities = new ArrayList<>();
 
-		for (ModelClient modelClient : currentGeneration().modelClients.values()) {
-			capabilities.add(modelClient.capability());
+		ClientGeneration generation = currentGeneration();
+
+		for (ModelClient modelClient : generation.modelClients.values()) {
+			ProviderCapability modelCapability = modelClient.capability();
+			ImageClient imageClient = generation.imageClients.get(modelCapability.getProvider());
+
+			if (imageClient == null) {
+				capabilities.add(modelCapability);
+				continue;
+			}
+
+			List<String> features = new ArrayList<>(modelCapability.getFeatures());
+			features.addAll(imageClient.capability().getFeatures());
+			capabilities.add(new ProviderCapability(modelCapability.getProvider(), features));
 		}
 
 		return capabilities;
@@ -314,6 +374,7 @@ public final class CommonLlm implements AutoCloseable {
 
 		private final CommonLlmConfig config;
 		private final Map<String, ModelClient> modelClients = new LinkedHashMap<>();
+		private final Map<String, ImageClient> imageClients = new LinkedHashMap<>();
 		private final Map<String, AgentClient> agentClients = new LinkedHashMap<>();
 		private final AtomicInteger inFlightCount = new AtomicInteger();
 		private final AtomicBoolean isRetired = new AtomicBoolean(false);
@@ -323,8 +384,18 @@ public final class CommonLlm implements AutoCloseable {
 			this.config = config;
 
 			for (ProviderConfig providerConfig : config.getProviders().values()) {
-				if (providerConfig.isEnabled()) {
-					modelClients.put(providerConfig.getInstanceName(), createModelClient(providerConfig, options));
+				if (!providerConfig.isEnabled()) {
+					continue;
+				}
+
+				ModelClient modelClient = createModelClient(providerConfig, options);
+				modelClients.put(providerConfig.getInstanceName(), modelClient);
+
+				// 图片客户端复用同一 Provider 的 SDK 客户端，Anthropic 没有图片生成能力
+				if (ProviderConfig.TYPE_OPENAI.equals(providerConfig.getType())) {
+					imageClients.put(providerConfig.getInstanceName(), new OpenAiImageClient(providerConfig, options.getIdGenerator(), (OpenAIClient) modelClient.nativeClient()));
+				} else if (ProviderConfig.TYPE_GEMINI.equals(providerConfig.getType())) {
+					imageClients.put(providerConfig.getInstanceName(), new GeminiImageClient(providerConfig, options.getIdGenerator(), (Client) modelClient.nativeClient()));
 				}
 			}
 
@@ -361,6 +432,21 @@ public final class CommonLlm implements AutoCloseable {
 			}
 
 			return modelClient;
+		}
+
+		private ImageClient getImageClient(String provider) {
+			ImageClient imageClient = imageClients.get(provider);
+
+			if (imageClient != null) {
+				return imageClient;
+			}
+
+			// 已启用的 Provider 没有图片客户端说明厂商不支持图片生成
+			if (modelClients.containsKey(provider)) {
+				throw CommonLlmException.of(ErrorCategory.SDK_UNSUPPORTED_FEATURE, "Provider 不支持图片生成：" + provider, provider);
+			}
+
+			throw CommonLlmException.of(ErrorCategory.CONFIG_INVALID, "Provider 未配置或未启用：" + provider, provider);
 		}
 
 		private AgentClient getAgentClient(String agent) {
@@ -401,6 +487,10 @@ public final class CommonLlm implements AutoCloseable {
 		private void closeClients() {
 			if (!isClosed.compareAndSet(false, true)) {
 				return;
+			}
+
+			for (ImageClient imageClient : imageClients.values()) {
+				imageClient.close();
 			}
 
 			for (ModelClient modelClient : modelClients.values()) {
