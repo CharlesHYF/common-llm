@@ -12,6 +12,7 @@
 
 ## 特性
 - 模型 API：OpenAI Responses 与 Chat Completions、Anthropic Messages、Gemini generateContent；支持非流式与流式、工具调用、结构化输出、图片输入。
+- 图片生成：OpenAI（Images API 或 Responses `image_generation` 工具，可配置）与 Gemini（generateContent 原生出图）；支持文生图、图生图、蒙版、流式部分图片与多张生成。
 - Coding Agent：Claude Code（`@anthropic-ai/claude-agent-sdk`）与 Codex（`@openai/codex-sdk`）；支持 run、流式事件、会话恢复、中断、审批回调（Claude Code）。
 - 配置：YAML / JSON 文件、`${ENV}` 引用、注入 `ConfigProvider`、运行时覆盖，按字段合并；`reload()` 失败时保留旧配置。
 - 错误分类：19 个统一分类，携带 `retriable`、`statusCode`、`vendorCode`、`requestId`。
@@ -356,6 +357,129 @@ console.log(response.text);
 await llm.close();
 ```
 
+### 图片生成
+图片生成走独立的 `generateImage()` / `streamImage()`，也可以用 `llm.image(provider)` 取得 `ImageClient`。支持的实例类型与路径：
+
+| 路径 | 配置 | 调用方式 |
+|---|---|---|
+| OpenAI Images API | `type: openai`，`image_api: images`（默认） | `images.generate`；有输入图片时 `images.edit` |
+| OpenAI Responses | `type: openai`，`image_api: responses` | `responses.create` 加 `image_generation` 工具，`default_model` 作为对话模型 |
+| Gemini | `type: gemini` | `models.generateContent`，`responseModalities: ["TEXT", "IMAGE"]` |
+
+Anthropic 没有图片生成能力，调用时报 `SDK_UNSUPPORTED_FEATURE`。图片模型名来自请求的 `model` 或配置的 `default_image_model`，两者都没有报 `CONFIG_INVALID`：
+
+```yaml
+providers:
+  openai:
+    enabled: true
+    api_key: ${OPENAI_API_KEY}
+    default_model: ${OPENAI_MODEL}
+    default_image_model: ${OPENAI_IMAGE_MODEL}
+    image_api: images
+    image_timeout_seconds: 300
+  gemini:
+    enabled: true
+    api_key: ${GEMINI_API_KEY}
+    default_image_model: ${GEMINI_IMAGE_MODEL}
+    image_concurrency: 2
+```
+
+文生图，`images[].data` 是图片字节（`Uint8Array`）：
+
+```ts
+import { writeFile } from "node:fs/promises";
+
+import { CommonLlm } from "@charleshyf/common-llm";
+
+const llm = await CommonLlm.create();
+
+const response = await llm.generateImage({
+	provider: "openai",
+	prompt: "一只橘色的猫坐在窗台上，水彩风格",
+	size: "1024x1024",
+	quality: "low",
+	outputFormat: "png",
+});
+
+for (const [index, image] of response.images.entries()) {
+	await writeFile(`cat-${index}.png`, image.data);
+	console.log(image.mimeType, image.revisedPrompt);
+}
+
+console.log(response.usage);
+await llm.close();
+```
+
+图生图与蒙版：传入 `images` 即为图生图，`mask` 只有 OpenAI 支持且需同时提供 `images`。`createImageInputFromFile` 按扩展名识别 MIME 类型（无法识别报 `CONFIG_INVALID`），`createImageInputFromBytes` 从字节构造：
+
+```ts
+import { readFile, writeFile } from "node:fs/promises";
+
+import { CommonLlm, createImageInputFromBytes, createImageInputFromFile } from "@charleshyf/common-llm";
+
+const llm = await CommonLlm.create();
+const photo = await createImageInputFromFile("room.png");
+const mask = createImageInputFromBytes(await readFile("mask.png"), "image/png");
+
+const response = await llm.generateImage({
+	provider: "openai",
+	prompt: "把沙发换成蓝色",
+	images: [
+		photo,
+	],
+	mask,
+	background: "opaque",
+});
+
+await writeFile("room-edited.png", response.images[0]?.data ?? new Uint8Array());
+await llm.close();
+```
+
+流式输出：OpenAI 两条路径在 `partialImages` 大于 0 时先发 `partial_image`，每张图完成时发 `image_completed`；Gemini 不产生部分图片。`streamImage()` 不抛异常，以唯一的 `completed` 或 `error` 事件结束：
+
+```ts
+import { writeFile } from "node:fs/promises";
+
+import { CommonLlm } from "@charleshyf/common-llm";
+
+const llm = await CommonLlm.create();
+
+for await (const event of llm.streamImage({
+	provider: "openai",
+	prompt: "雪山下的小木屋",
+	partialImages: 2,
+})) {
+	if (event.type === "partial_image") {
+		await writeFile(`partial-${event.imageIndex}-${event.partialIndex}.png`, event.data);
+	} else if (event.type === "image_completed") {
+		await writeFile(`final-${event.imageIndex}.png`, event.image.data);
+	} else if (event.type === "error") {
+		console.error(event.error.category, event.error.message);
+	}
+}
+
+await llm.close();
+```
+
+多张生成：OpenAI Images API 原生支持 `n`（1 到 10），一次请求返回多张；Responses 路径与 Gemini 由本库循环调用 `n` 次。循环按配置 `image_concurrency`（默认 1，即串行）并发，结果按调用顺序排列，`usage` 逐项求和（任一次为 `null` 则该项为 `null`），`text` 为各次文字按换行连接；任一次失败则整体失败，不返回已生成的图片，未开始的请求不再发出，进行中的请求被取消。流式时按图片顺序输出事件，`imageIndex` 区分第几张。
+
+各路径支持的参数，表中"否"的字段非空时报 `SDK_UNSUPPORTED_FEATURE`：
+
+| 参数 | OpenAI Images | OpenAI Responses | Gemini |
+|---|---|---|---|
+| `images`（base64） | 是，最多 16 张 | 是 | 是 |
+| `images`（URL） | 否 | 是 | 否 |
+| `mask` | 是 | 是（仅 base64） | 否 |
+| `n` | 原生（1 到 10） | 库内循环 | 库内循环 |
+| `size` / `quality` / `outputFormat` / `outputCompression` / `background` | 是 | 是（作为工具参数） | 否 |
+| `partialImages` | 仅 `streamImage` | 仅 `streamImage` | 否（只能为 0） |
+| `aspectRatio` / `imageSize` | 否 | 否 | 是 |
+| `providerOptions` | 请求体额外字段 | 请求体额外字段 | `httpOptions.extraBody` |
+
+`providerOptions` 与本库已映射的字段重名时报 `CONFIG_INVALID`：Images API 为 `model`、`prompt`、`n`、`size`、`quality`、`output_format`、`output_compression`、`background`、`partial_images`、`stream`、`image`、`mask`；Responses 路径为 `model`、`input`、`tools`、`tool_choice`、`stream`（多轮修改图片可透传 `previous_response_id`）；Gemini 为 `contents`、`generationConfig`。能力可通过 `supports()` 查询：`image_generation`、`image_edit`、`image_mask`、`image_streaming`（部分图片）、`image_multiple`（原生多张）。
+
+需要契约 JSON（图片字节为 base64）时使用 `serializeImageResponse(response)` 与 `serializeImageEvent(event)`。
+
 ### 厂商原生参数
 未统一的厂商参数用请求级 `providerOptions` 或配置级 `native_options` 透传，两者合并且请求级优先。OpenAI 与 Anthropic 作为请求体的额外字段发送，Gemini 经 `httpOptions.extraBody` 合并进请求体。与本库已映射的字段（如 `model`、`messages`、`tools`）重名时报 `CONFIG_INVALID`，不会静默覆盖。
 
@@ -650,7 +774,11 @@ await llm.close();
 | `base_url` | SDK 默认值 | 兼容端点或代理地址 |
 | `default_model` | 无 | 请求未指定 `model` 时使用 |
 | `timeout_seconds` / `max_retries` | 继承 `common` | 实例级覆盖 |
-| `native_options` | `{}` | 每次请求附加的原生参数 |
+| `native_options` | `{}` | 每次模型请求附加的原生参数（不用于图片生成） |
+| `default_image_model` | 无 | 图片模型，请求未指定 `model` 时使用 |
+| `image_api` | `images` | 仅 `type: openai`：`images` / `responses` |
+| `image_concurrency` | `1` | Responses 路径与 Gemini 库内循环生成多张时的并发数 |
+| `image_timeout_seconds` | 继承 `timeout_seconds` | 单次图片生成请求超时 |
 
 `agents.claude_code` 与 `agents.codex` 常用字段：
 
@@ -678,7 +806,7 @@ await llm.close();
 认证方面，Claude Code 在 `auth_mode: api_key` 时向子进程注入 `ANTHROPIC_API_KEY`，Codex 使用 SDK 的 `apiKey` 选项。第三方产品不得复用用户的个人订阅登录，Claude Agent SDK 按 Anthropic Commercial Terms 使用 API key。
 
 ## 错误处理
-`generate()` 失败时抛出 `CommonLlmError`，`error.info` 是 `ErrorInfo`（`category`、`message`、`provider`、`retriable`、`requestId`、`vendorCode`、`statusCode`、`cause`），消息与 `cause` 已做密钥脱敏。`stream()` 与 `runStream()` 不抛异常，以唯一的 `error` / `failed` / `cancelled` 终止事件结束；`run()` 不抛异常，返回 `status: "failed"` 或 `"cancelled"` 的 `AgentResult` 并附 `error`。配置错误（如 Provider 未启用）在调用入口直接抛出。
+`generate()` 失败时抛出 `CommonLlmError`，`error.info` 是 `ErrorInfo`（`category`、`message`、`provider`、`retriable`、`requestId`、`vendorCode`、`statusCode`、`cause`），消息与 `cause` 已做密钥脱敏。`stream()` 与 `runStream()` 不抛异常，以唯一的 `error` / `failed` / `cancelled` 终止事件结束；`run()` 不抛异常，返回 `status: "failed"` 或 `"cancelled"` 的 `AgentResult` 并附 `error`。配置错误（如 Provider 未启用）在调用入口直接抛出。图片生成与模型调用一致：`generateImage()` 抛出 `CommonLlmError`，`streamImage()` 以唯一的 `error` 事件结束。
 
 ```ts
 import { CommonLlm, isCommonLlmError } from "@charleshyf/common-llm";
@@ -724,7 +852,7 @@ await llm.close();
 
 | category | 触发条件 | 可重试 |
 |---|---|---|
-| `CONFIG_INVALID` | 配置缺失或非法、`providerOptions` / `nativeOptions` 键冲突、工作目录无效 | 否 |
+| `CONFIG_INVALID` | 配置缺失或非法、`providerOptions` / `nativeOptions` 键冲突、工作目录无效、输入图片无法识别 MIME 类型 | 否 |
 | `AUTH_MISSING` | 需要的 key 为空 | 否 |
 | `AUTH_FAILED` | HTTP 401；Gemini 400 且详情含 `API_KEY_INVALID` | 否 |
 | `PERMISSION_DENIED` | HTTP 403 | 否 |
@@ -734,8 +862,8 @@ await llm.close();
 | `TIMEOUT` | 请求或 run 超时、HTTP 408 | 是 |
 | `CANCELLED` | 调用方取消 | 否 |
 | `NETWORK_ERROR` | 连接失败 | 是 |
-| `PROVIDER_ERROR` | 5xx（可重试）、其余 4xx、Agent 结果失败 | 视状态码 |
-| `SDK_UNSUPPORTED_FEATURE` | 请求了 Provider / Agent / CLI 不支持的能力 | 否 |
+| `PROVIDER_ERROR` | 5xx（可重试）、其余 4xx（含 OpenAI 内容审核拒绝 `moderation_blocked`）、Gemini 未返回图片（`vendorCode` 为 finishReason）、Agent 结果失败 | 视状态码 |
+| `SDK_UNSUPPORTED_FEATURE` | 请求了 Provider / Agent / CLI 不支持的能力，或图片请求用了所选路径不支持的字段 | 否 |
 | `CLI_NOT_FOUND` | 可执行文件不存在 | 否 |
 | `CLI_VERSION_UNSUPPORTED` | CLI 版本低于最低支持版本 | 否 |
 | `CLI_PROCESS_FAILED` | 非零退出且没有结果、输出超过上限 | 否 |
@@ -773,6 +901,9 @@ await llm.close();
 - Claude Code 不发出 `file_changed` 事件（从 Edit / Write 工具推断属于猜测）；本机 CLI 2.1.325 的帮助中没有 `--max-turns`，`nativeOptions.maxTurns` 报 `SDK_UNSUPPORTED_FEATURE`。
 - `executable_path` 默认在 `PATH` 中查找 `claude`，不使用 Agent SDK 自带的 CLI 二进制。
 - 两个 Agent SDK 只提供 ESM，CJS 入口通过动态 `import()` 加载它们。
+- Gemini 图片生成不支持蒙版、部分图片、URL 输入与 `size` / `quality` / `outputFormat` / `outputCompression` / `background`，只支持 `aspectRatio` 与 `imageSize`；也不支持 Imagen（`generateImages` 只在 Vertex AI 可用）。OpenAI `createVariation` 不支持。
+- 图片生成只透传请求级 `providerOptions`，不附加配置中的 `native_options`（后者面向模型调用，例如 Anthropic 的 `max_tokens`）。
+- 库内循环（Responses 路径与 Gemini 的 `n > 1`）的流式输出按图片顺序发事件，后面的调用即使先完成，也要等前面的图片输出完才发出；循环时 `rawResponse` 为每次响应组成的数组，流式时不提供 `rawResponse`。
 
 ## 示例
 示例需先执行 `pnpm run build`。Node 24 可以直接运行 `.ts` 文件，Node 22.18 之前的版本需加 `--experimental-strip-types`。
@@ -784,6 +915,7 @@ await llm.close();
 | `examples/coding-agent.ts` | 运行 Coding Agent 并打印事件 | `node examples/coding-agent.ts codex /path/to/repo` |
 | `examples/multi-provider-config.ts` | 同时配置 OpenAI 与兼容端点并按实例名调用 | `node examples/multi-provider-config.ts` |
 | `examples/database-config-provider.ts` | 用内存表实现 `ConfigProvider` 并 reload | `node examples/database-config-provider.ts` |
+| `examples/image-generation.ts` | 文生图并把图片保存到文件 | `node examples/image-generation.ts openai ./output` |
 
 ## 许可证
 [MIT](../LICENSE)
