@@ -1,0 +1,5 @@
+# 真实配置文件可能含密钥
+common-llm.yaml
+common-llm.json
+target/
+examples/target/
