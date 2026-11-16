@@ -21,7 +21,8 @@ public final class ConfigResolver {
 	private static final Set<String> ROOT_KEYS = Set.of("common", "providers", "agents");
 	private static final Set<String> COMMON_KEYS = Set.of("timeout_seconds", "connect_timeout_seconds", "max_retries", "log_level");
 	private static final Set<String> LOG_LEVELS = Set.of("DEBUG", "INFO", "WARN", "ERROR");
-	private static final Set<String> PROVIDER_KEYS = Set.of("type", "api", "enabled", "api_key", "base_url", "default_model", "timeout_seconds", "max_retries", "native_options");
+	private static final Set<String> PROVIDER_KEYS = Set.of("type", "api", "enabled", "api_key", "base_url", "default_model", "timeout_seconds", "max_retries", "native_options", "default_image_model", "image_api", "image_concurrency", "image_timeout_seconds");
+	private static final Set<String> IMAGE_APIS = Set.of(ProviderConfig.IMAGE_API_IMAGES, ProviderConfig.IMAGE_API_RESPONSES);
 	private static final Set<String> PROVIDER_TYPES = Set.of(ProviderConfig.TYPE_OPENAI, ProviderConfig.TYPE_ANTHROPIC, ProviderConfig.TYPE_GEMINI);
 	private static final Set<String> OPENAI_APIS = Set.of(ProviderConfig.API_RESPONSES, ProviderConfig.API_CHAT_COMPLETIONS);
 	private static final Set<String> AGENT_NAMES = Set.of(AgentConfig.AGENT_CLAUDE_CODE, AgentConfig.AGENT_CODEX);
@@ -126,13 +127,22 @@ public final class ConfigResolver {
 		double timeoutSeconds = reader.readPositiveNumber(providerTree, "timeout_seconds", fieldPath, common.getTimeoutSeconds());
 		int maxRetries = (int) reader.readNonNegativeInteger(providerTree, "max_retries", fieldPath, common.getMaxRetries());
 		Map<String, Object> nativeOptions = reader.readMap(providerTree, "native_options", fieldPath);
+		String defaultImageModel = emptyToNull(reader.readString(providerTree, "default_image_model", fieldPath));
+		String imageApi = reader.readEnum(providerTree, "image_api", fieldPath, IMAGE_APIS, ProviderConfig.IMAGE_API_IMAGES);
+
+		if (providerTree.containsKey("image_api") && !ProviderConfig.TYPE_OPENAI.equals(type)) {
+			throw invalid(fieldPath + ".image_api 只适用于 type=openai");
+		}
+
+		int imageConcurrency = (int) reader.readPositiveInteger(providerTree, "image_concurrency", fieldPath, ProviderConfig.DEFAULT_IMAGE_CONCURRENCY);
+		double imageTimeoutSeconds = reader.readPositiveNumber(providerTree, "image_timeout_seconds", fieldPath, timeoutSeconds);
 
 		if (isEnabled && (apiKey == null || apiKey.isEmpty())) {
 			throw new CommonLlmException(ErrorInfo.builder(ErrorCategory.AUTH_MISSING, fieldPath + ".api_key 为空" + reader.describeMissing(fieldPath + ".api_key")).provider(instanceName).build());
 		}
 
 		SecretMasker.registerSecret(apiKey);
-		return new ProviderConfig(instanceName, type, api, isEnabled, emptyToNull(apiKey), baseUrl, defaultModel, timeoutSeconds, common.getConnectTimeoutSeconds(), maxRetries, nativeOptions);
+		return new ProviderConfig(instanceName, type, api, isEnabled, emptyToNull(apiKey), baseUrl, defaultModel, timeoutSeconds, common.getConnectTimeoutSeconds(), maxRetries, nativeOptions, defaultImageModel, imageApi, imageConcurrency, imageTimeoutSeconds);
 	}
 
 	private static AgentConfig parseAgent(ConfigTreeReader reader, String name, Map<String, Object> agentTree, String fieldPath) {
