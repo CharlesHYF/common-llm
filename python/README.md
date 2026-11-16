@@ -1,5 +1,5 @@
 <h1 align="center">common-llm for Python</h1>
-<p align="center">用同一套 async 接口调用 OpenAI、Anthropic、Gemini 模型 API 与 Claude Code、Codex 两个 Coding Agent</p>
+<p align="center">用同一套 async 接口调用 OpenAI、Anthropic、Gemini 模型 API、图片生成与 Claude Code、Codex 两个 Coding Agent</p>
 
 <div align="center">
 
@@ -8,10 +8,11 @@
 </div>
 
 ## 介绍
-common-llm 是一个可直接复制进项目的 Python 库，把三家模型 API 和两个 Coding Agent 的调用、流式事件、错误与配置统一成同一套契约，底层全部经由各厂商官方 SDK 调用。它解决的是每个项目重复封装 SDK、CLI、凭证与错误处理的问题。它不是 HTTP 网关，不做自动模型路由、成本优化或 Agent 编排，调用方始终显式指定 Provider 与模型。
+common-llm 是一个可直接复制进项目的 Python 库，把三家模型 API、OpenAI 与 Gemini 图片生成和两个 Coding Agent 的调用、流式事件、错误与配置统一成同一套契约，底层全部经由各厂商官方 SDK 调用。它解决的是每个项目重复封装 SDK、CLI、凭证与错误处理的问题。它不是 HTTP 网关，不做自动模型路由、成本优化或 Agent 编排，调用方始终显式指定 Provider 与模型。
 
 ## 特性
 - 模型 API：OpenAI（Responses 与 Chat Completions）、Anthropic Messages、Gemini generateContent；支持非流式与流式生成、工具调用、结构化输出、图片输入，厂商原生参数经 SDK 的 extra body 机制透传。
+- 图片生成：OpenAI（Images API 或 Responses `image_generation` 工具，可配置）与 Gemini（generateContent 原生出图）；支持文生图、图生图、蒙版、流式部分图片与多张生成，路径不支持原生多张时按配置并发库内循环。
 - Coding Agent：Claude Code（`claude-agent-sdk`）与 Codex（`openai-codex`，App Server），支持流式事件、会话恢复、中断与运行中审批。
 - 配置：YAML / JSON 文件、`${ENV}` 引用、可注入的 `ConfigProvider`（如数据库），按字段合并，`reload()` 失败时保留旧配置。
 - 错误分类：19 个统一分类，携带是否可重试、HTTP 状态码、厂商错误码与请求 ID。
@@ -269,6 +270,91 @@ async def compare(llm: CommonLlm) -> None:
         print(provider, response.text)
 ```
 
+### 图片生成
+`generate_image()` 返回 `ImageResponse`，图片在 `response.images` 中，`GeneratedImage.data` 为图片字节（`bytes`），`save(path)` 直接写文件；序列化为契约 JSON 时 `data` 为 base64。OpenAI 的图片路径由配置 `image_api` 选择：`images`（默认，Images API）或 `responses`（Responses API 的 `image_generation` 工具，对话模型取 `default_model`）；Gemini 经 `generateContent` 原生出图；Anthropic 调用时报 `SDK_UNSUPPORTED_FEATURE`。图片模型缺省取配置 `default_image_model`。
+
+文生图：
+
+```python
+from pathlib import Path
+
+from common_llm import CommonLlm, ImageRequest
+
+
+async def draw_cat(llm: CommonLlm, output: Path) -> None:
+    request = ImageRequest(provider="openai", prompt="一只橘猫坐在窗台上，水彩风格", size="1024x1024", quality="high", output_format="png", n=2)
+    response = await llm.generate_image(request)
+    for index, image in enumerate(response.images):
+        image.save(output / f"cat-{index}.png")
+        print(image.mime_type, image.revised_prompt)
+
+    print(response.usage.total_tokens)
+```
+
+图生图与蒙版：`images` 有值即为编辑（Images 路径调用 `images.edit`，最多 16 张），`mask` 只支持 OpenAI 且必须同时提供 `images`。`ImageInput.from_file()` 与 `ImageInput.from_bytes()` 按文件头（其次扩展名）识别 MIME 类型，无法识别时报 `CONFIG_INVALID`。
+
+```python
+from pathlib import Path
+
+from common_llm import CommonLlm, ImageInput, ImageRequest, ImageResponse
+
+
+async def edit_photo(llm: CommonLlm, photo: Path, mask: Path) -> ImageResponse:
+    request = ImageRequest(
+        provider="openai",
+        prompt="把背景换成海边",
+        images=[ImageInput.from_file(photo)],
+        mask=ImageInput.from_file(mask),
+        background="opaque",
+    )
+    return await llm.generate_image(request)
+
+
+async def gemini_variant(llm: CommonLlm, photo_bytes: bytes) -> ImageResponse:
+    request = ImageRequest(
+        provider="gemini",
+        prompt="改成像素风",
+        images=[ImageInput.from_bytes(photo_bytes, "image/png")],
+        aspect_ratio="16:9",
+        image_size="2K",
+    )
+    return await llm.generate_image(request)
+```
+
+流式：`stream_image()` 依次产生 `started`、`partial_image`（只在厂商返回部分图片时）、`image_completed`、`usage`（只在厂商返回过用量时）、`completed`，失败时以唯一的 `error` 事件结束，不抛异常。`partial_images` 只在流式请求中可用，非流式请求带该字段报 `SDK_UNSUPPORTED_FEATURE`；流式结果不提供 `raw_response`。
+
+```python
+from common_llm import CommonLlm, ImageCompletedEvent, ImageErrorEvent, ImageGeneratedEvent, ImagePartialEvent, ImageRequest
+
+
+async def stream_cat(llm: CommonLlm) -> None:
+    request = ImageRequest(provider="openai", prompt="一只橘猫", partial_images=2)
+    async for event in llm.stream_image(request):
+        if isinstance(event, ImagePartialEvent):
+            print(f"第 {event.image_index} 张的第 {event.partial_index} 张部分图片，{len(event.data)} 字节")
+        elif isinstance(event, ImageGeneratedEvent):
+            print(f"第 {event.image_index} 张完成")
+        elif isinstance(event, ImageCompletedEvent):
+            print(f"共 {len(event.response.images)} 张")
+        elif isinstance(event, ImageErrorEvent):
+            print(f"失败：{event.error.category.value}")
+```
+
+多张生成：Images 路径原生支持 `n`（一次请求，最大 10，超出报 `CONFIG_INVALID`）；Responses 与 Gemini 路径在库内循环 `n` 次，并发数由 `image_concurrency` 控制（默认 1，串行）。任一次失败即整体失败，返回该次的错误，未开始的请求不再发出，进行中的请求取消；结果按调用顺序排列，用量逐项求和，`text` 为各次文字按换行连接，`id`、`model`、`request_id` 取最后一次，`include_raw_response=True` 时 `raw_response` 为各次原始响应组成的列表。流式循环同样按 `image_concurrency` 并发，但按图片顺序输出事件（后完成的调用等前面的图片发完再输出），只发一个 `started`，`image_index` 跨调用连续编号。
+
+各路径支持的字段（不支持的字段一律报 `SDK_UNSUPPORTED_FEATURE`）：
+
+| 字段 | OpenAI Images | OpenAI Responses | Gemini |
+|---|---|---|---|
+| `images` | base64，最多 16 张（超出报 `CONFIG_INVALID`） | base64 或 URL | base64 |
+| `mask` | 支持 | 支持（`input_image_mask`） | 不支持 |
+| `n` | 原生 | 库内循环 | 库内循环 |
+| `size` / `quality` / `output_format` / `output_compression` / `background` | 支持 | 支持（写入工具参数） | 不支持 |
+| `partial_images` | 流式支持 | 流式支持 | 不支持 |
+| `aspect_ratio` / `image_size` | 不支持 | 不支持 | 支持（`imageConfig`） |
+
+图片请求只透传请求级 `provider_options`，不附加配置中的 `native_options`（该字段面向模型调用）；与已映射字段重名（如 Images 的 `prompt`、`image`，Responses 的 `tools`、`tool_choice`，Gemini 的 `contents`、`generationConfig.imageConfig`）时报 `CONFIG_INVALID`。Responses 路径多轮修改图片时用 `provider_options={"previous_response_id": ...}` 传入上一次的响应 ID。`llm.image(provider)` 返回 `ImageClient`，提供 `generate`、`stream`、`capability`、`supports`、`native_client`（与同名 `ModelClient` 共用 SDK 客户端）。
+
 ### Coding Agent
 `run()` 返回 `AgentResult`，`run_stream()` 逐个返回 `AgentEvent`，两者都不抛异常，失败以 `status="failed"` 或唯一的 `failed` 事件返回。`resume(session_id, request)` 在已有会话上继续；`interrupt(run_id)` 中断进行中的 run，结果为 `cancelled`。
 
@@ -417,7 +503,11 @@ async def list_models(llm: CommonLlm) -> None:
 | `providers.<实例名>.base_url` | SDK 默认值 | |
 | `providers.<实例名>.default_model` | 无 | 请求未指定 `model` 时使用 |
 | `providers.<实例名>.timeout_seconds` / `max_retries` | 继承 `common` | |
-| `providers.<实例名>.native_options` | `{}` | 每次请求附加的原生参数；Anthropic 的 `max_tokens` 作为 `max_output_tokens` 的默认值 |
+| `providers.<实例名>.native_options` | `{}` | 每次模型请求附加的原生参数（不用于图片生成）；Anthropic 的 `max_tokens` 作为 `max_output_tokens` 的默认值 |
+| `providers.<实例名>.default_image_model` | 无 | 图片模型，`ImageRequest.model` 未指定时使用 |
+| `providers.<实例名>.image_api` | `images` | 仅 `type: openai`：`images` / `responses` |
+| `providers.<实例名>.image_concurrency` | 1 | 库内循环生成多张时的并发数，最小为 1 |
+| `providers.<实例名>.image_timeout_seconds` | 继承 `timeout_seconds` | 图片生成单次请求超时 |
 | `agents.<claude_code\|codex>.enabled` | `false` | |
 | `agents.*.auth_mode` | `cli_existing_session` | `api_key` / `cli_existing_session` / `vendor_supported` |
 | `agents.*.executable_path` | `claude` / `codex` | 在 `PATH` 中查找 |
@@ -435,7 +525,7 @@ async def list_models(llm: CommonLlm) -> None:
 完整示例见本目录的 `common-llm.example.yaml`，复制为 `common-llm.yaml` 后修改；`common-llm.yaml` 已在 `.gitignore` 中忽略，不要提交真实密钥。
 
 ## 错误处理
-只有 `generate()` 会抛出 `CommonLlmError`，`error.info` 是 `ErrorInfo`（`category`、`message`、`provider`、`retriable`、`request_id`、`vendor_code`、`status_code`、`cause`，均已脱敏）。`stream()`、`run()`、`run_stream()` 不抛异常，失败（包括 Provider 不存在、配置非法、CLI 不存在、工作目录非法等预检失败）以唯一的 `error` / `failed` 终止事件或 `status="failed"` 的 `AgentResult` 返回。任务被取消时 `asyncio.CancelledError` 照常向上传播。
+只有 `generate()` 与 `generate_image()` 会抛出 `CommonLlmError`，`error.info` 是 `ErrorInfo`（`category`、`message`、`provider`、`retriable`、`request_id`、`vendor_code`、`status_code`、`cause`，均已脱敏）。`stream()`、`stream_image()`、`run()`、`run_stream()` 不抛异常，失败（包括 Provider 不存在、配置非法、CLI 不存在、工作目录非法等预检失败）以唯一的 `error` / `failed` 终止事件或 `status="failed"` 的 `AgentResult` 返回。任务被取消时 `asyncio.CancelledError` 照常向上传播。
 
 ```python
 from common_llm import CommonLlm, CommonLlmError, ErrorCategory, Message, ModelRequest
@@ -454,7 +544,7 @@ async def generate_or_none(llm: CommonLlm) -> str | None:
     return response.text
 ```
 
-模型请求的重试交给各 SDK 内置机制（`max_retries`），本库不再额外重试。
+模型请求的重试交给各 SDK 内置机制（`max_retries`），本库不再额外重试。图片生成补充：OpenAI 内容审核拒绝（错误码如 `moderation_blocked`）为 `PROVIDER_ERROR`，不可重试，`vendor_code` 为厂商错误码；Gemini 响应中没有图片时为 `PROVIDER_ERROR`，`vendor_code` 为 `finishReason`（如 `IMAGE_SAFETY`）；对 Anthropic 调用图片生成报 `SDK_UNSUPPORTED_FEATURE`；输入图片无法识别 MIME 类型报 `CONFIG_INVALID`。
 
 | category | 触发条件 | 可重试 |
 |---|---|---|
@@ -505,6 +595,8 @@ async def generate_or_none(llm: CommonLlm) -> str | None:
 - 两个 Agent SDK 都会把父进程环境变量与传入的 `env` 合并，本库把未列入 `env_allowlist` 且不属于运行必需（`PATH`、`HOME` 等）的变量置为空字符串，而不是从子进程环境中移除。
 - `openai-codex` 的 `AsyncCodex` 不接受审批处理器，Codex 适配器改用 `CodexClient` 并在线程中调用；为保证审批事件与通知的先后顺序，适配器覆盖了 `CodexClient` 的内部方法 `_coerce_notification`，升级 `openai-codex` 时需要复核。
 - Claude Code 不发出 `file_changed` 事件（从 Edit / Write 工具调用推断属于猜测）；Codex 不提供成本，`cost_usd` 为 `None`。
+- Gemini 图片生成不支持蒙版、部分图片（`partial_images`）、`size`、`quality`、`output_format`、`output_compression`、`background`，也不支持 URL 输入图片，传入时报 `SDK_UNSUPPORTED_FEATURE`；不支持 Imagen（只在 Vertex AI 可用）。
+- OpenAI Images 路径不支持 URL 输入图片，本库不代为下载；Images API 用量没有缓存与推理明细，`cached_input_tokens` 与 `reasoning_tokens` 为 `None`。
 
 ## 示例
 | 文件 | 用途 | 运行命令 |
@@ -513,6 +605,7 @@ async def generate_or_none(llm: CommonLlm) -> str | None:
 | `examples/stream_generation.py` | 流式打印文本增量与完成原因 | `uv run python examples/stream_generation.py anthropic` |
 | `examples/coding_agent.py` | 执行一次 Agent run，打印事件流并使用自定义审批处理器 | `uv run python examples/coding_agent.py claude_code ./workspace` |
 | `examples/config_switch.py` | 同时配置官方 OpenAI 与 OpenAI 兼容端点，按实例名切换 | `uv run python examples/config_switch.py` |
+| `examples/image_generation.py` | 文生图并把结果保存到文件 | `uv run python examples/image_generation.py openai ./output` |
 | `examples/database_config_provider.py` | 用 `sqlite3` 配置表实现 `ConfigProvider` 并演示 `reload()` | `uv run python examples/database_config_provider.py` |
 
 ## 许可证
