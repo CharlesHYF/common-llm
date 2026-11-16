@@ -15,6 +15,7 @@ It is a library, not an HTTP gateway or an agent orchestration framework: caller
 
 ## Features
 - **Unified model calls**: `generate` and `stream` cover text generation, streaming, tool calling, structured output (JSON Schema) and image input.
+- **Image generation**: `generateImage` and `streamImage` cover text-to-image and image-to-image for OpenAI (Images API or the Responses `image_generation` tool, selected by `image_api`) and Gemini (native image output), with masks, partial images and multiple images where the vendor supports them.
 - **Official SDKs first**: all three model APIs are called through their official SDKs. OpenAI supports both the Responses API and Chat Completions, so OpenAI-compatible endpoints work too.
 - **Coding agents**: Claude Code and Codex share `run`, `runStream`, `resume`, `interrupt` and capability queries, with normalized events such as `started`, `message`, `tool_started`, `tool_completed`, `file_changed`, `approval_requested`, `usage` and `completed`.
 - **Safe defaults**: approval requests are declined when no handler is provided; Codex runs in a `workspace-write` sandbox with network access off; arguments are passed to subprocesses as arrays, never through a shell; timeouts and cancellation terminate the whole process group.
@@ -44,6 +45,7 @@ flowchart LR
 | OpenAI (Responses / Chat Completions) | `openai-java` | `openai-go/v3` | `openai` | `openai` |
 | Anthropic (Messages) | `anthropic-java` | `anthropic-sdk-go/v2` | `anthropic` | `@anthropic-ai/sdk` |
 | Gemini | `google-genai` | `google.golang.org/genai` | `google-genai` | `@google/genai` |
+| Image generation (OpenAI / Gemini) | official SDK | official SDK | official SDK | official SDK |
 | Claude Code | `claude -p` subprocess | `claude -p` subprocess | `claude-agent-sdk` | `@anthropic-ai/claude-agent-sdk` |
 | Codex | `codex app-server` JSON-RPC | `codex app-server` JSON-RPC | `openai-codex` | `@openai/codex-sdk` |
 
@@ -136,7 +138,7 @@ console.log(response.text);
 await llm.close();
 ```
 
-See the language READMEs for streaming, tool calling, coding agents, multiple provider instances and more.
+See the language READMEs for streaming, tool calling, image generation, coding agents, multiple provider instances and more.
 
 ## Configuration
 - Lookup order: a path passed explicitly in code, then the `COMMON_LLM_CONFIG` environment variable, then `common-llm.yaml` in the working directory.

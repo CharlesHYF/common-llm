@@ -15,6 +15,7 @@ common-llm 把 OpenAI、Anthropic、Google Gemini 三家模型 API，以及 Clau
 
 ## 特性
 - **统一的模型调用**：`generate` 与 `stream` 覆盖文本生成、流式输出、工具调用、结构化输出（JSON Schema）与图片输入。
+- **图片生成**：`generateImage` 与 `streamImage` 覆盖 OpenAI（Images API 或 Responses `image_generation` 工具，由 `image_api` 切换）与 Gemini（原生出图）的文生图、图生图，厂商支持时提供蒙版、部分图片与多张输出。
 - **官方 SDK 优先**：三家模型 API 全部经官方 SDK 调用；OpenAI 同时支持 Responses API 与 Chat Completions，可接入 OpenAI 兼容端点。
 - **Coding Agent**：Claude Code 与 Codex 统一提供 `run`、`runStream`、`resume`、`interrupt` 与能力查询，事件统一为 `started`、`message`、`tool_started`、`tool_completed`、`file_changed`、`approval_requested`、`usage`、`completed` 等类型。
 - **安全默认值**：审批请求未提供处理器时一律拒绝；Codex 默认 `workspace-write` 沙箱且关闭网络；参数以数组传给子进程，不拼接 shell；超时与取消会结束整个进程组。
@@ -44,6 +45,7 @@ flowchart LR
 | OpenAI（Responses / Chat Completions） | `openai-java` | `openai-go/v3` | `openai` | `openai` |
 | Anthropic（Messages） | `anthropic-java` | `anthropic-sdk-go/v2` | `anthropic` | `@anthropic-ai/sdk` |
 | Gemini | `google-genai` | `google.golang.org/genai` | `google-genai` | `@google/genai` |
+| 图片生成（OpenAI / Gemini） | 官方 SDK | 官方 SDK | 官方 SDK | 官方 SDK |
 | Claude Code | `claude -p` 子进程 | `claude -p` 子进程 | `claude-agent-sdk` | `@anthropic-ai/claude-agent-sdk` |
 | Codex | `codex app-server` JSON-RPC | `codex app-server` JSON-RPC | `openai-codex` | `@openai/codex-sdk` |
 
@@ -134,7 +136,7 @@ console.log(response.text);
 await llm.close();
 ```
 
-流式输出、工具调用、Coding Agent、多 Provider 实例等用法见各语言 README。
+流式输出、工具调用、图片生成、Coding Agent、多 Provider 实例等用法见各语言 README。
 
 ## 配置
 - 查找顺序：代码中显式传入的路径，其次环境变量 `COMMON_LLM_CONFIG`，最后是工作目录下的 `common-llm.yaml`。
