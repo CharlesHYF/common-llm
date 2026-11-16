@@ -1,0 +1,56 @@
+# 本地设计文档与跨语言契约源，不进仓库
+docs/
+contracts/
+AGENTS.md
+
+# 真实配置文件可能含密钥
+common-llm.yaml
+common-llm.json
+.env
+.env.*
+
+# 构建产物
+target/
+dist/
+build/
+out/
+*.class
+*.jar
+
+# 依赖
+node_modules/
+.pnpm-store/
+vendor/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Go
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# AI 工具残留
+.claude/
+.codex/
+.cursor/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 日志与覆盖率
+*.log
+coverage/
