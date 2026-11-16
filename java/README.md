@@ -12,6 +12,7 @@ common-llm for Java 把三家模型 API 与两种 Coding Agent 收敛到同一�
 
 ## 特性
 - 模型 API：OpenAI（Responses API 与 Chat Completions）、Anthropic Messages、Gemini generateContent；统一的 `generate` / `stream`，支持工具调用、JSON Schema 结构化输出、图片输入与厂商原生参数透传。
+- 图片生成：OpenAI（Images API 与 Responses API `image_generation` 工具两条路径）与 Gemini（`generateContent` 原生出图）；统一的 `generateImage` / `streamImage`，支持文生图、图生图、蒙版、部分图片流式输出与多张生成。
 - Coding Agent：Claude Code 与 Codex；统一的 `run` / `runStream` / `resume` / `interrupt`，运行前探测可执行文件、版本与 CLI 参数集合。
 - 配置：YAML 或 JSON 文件、`${ENV}` 环境变量引用、可注入的 `ConfigProvider`（例如数据库），按字段合并，`reload()` 失败时保留旧配置。
 - 错误分类：19 个统一分类，携带 `retriable`、HTTP 状态码、厂商错误码与请求 ID，消息已脱敏。
@@ -336,6 +337,121 @@ public class MultipleProviders {
 }
 ```
 
+### 图片生成
+在 Provider 实例上配置图片模型 `default_image_model`；`type: openai` 的实例可用 `image_api` 选择 `images`（默认，Images API）或 `responses`（Responses API 的 `image_generation` 工具，对话模型取 `default_model`）。Anthropic 没有图片生成能力，调用时报 `SDK_UNSUPPORTED_FEATURE`。
+```yaml
+providers:
+  openai:
+    enabled: true
+    api_key: ${OPENAI_API_KEY}
+    default_model: ${OPENAI_MODEL}
+    default_image_model: ${OPENAI_IMAGE_MODEL}
+    image_api: images
+  gemini:
+    enabled: true
+    api_key: ${GEMINI_API_KEY}
+    default_image_model: ${GEMINI_IMAGE_MODEL}
+```
+
+文生图、图生图与蒙版：`ImageResponse.getImages()` 返回 `GeneratedImage` 列表，`getData()` 是图片字节。输入图片可用 `ImageInput.fromFile`、`fromBytes`、`fromBase64` 构造；`fromUrl` 只有 Responses 路径支持，本库不代为下载。
+```java
+import io.github.charleshyf.commonllm.CommonLlm;
+import io.github.charleshyf.commonllm.core.GeneratedImage;
+import io.github.charleshyf.commonllm.core.ImageInput;
+import io.github.charleshyf.commonllm.core.ImageRequest;
+import io.github.charleshyf.commonllm.core.ImageResponse;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class ImageGeneration {
+
+	public static void main(String[] args) throws IOException {
+		try (CommonLlm commonLlm = CommonLlm.create()) {
+			ImageResponse created = commonLlm.generateImage(ImageRequest.builder()
+				.provider("openai")
+				.prompt("一只橘色的猫坐在窗台上，水彩风格")
+				.size("1024x1024")
+				.quality("low")
+				.outputFormat("png")
+				.imageCount(2)
+				.build());
+
+			for (GeneratedImage image : created.getImages()) {
+				System.out.println(image.getMimeType() + " " + image.getData().length + " bytes, revisedPrompt=" + image.getRevisedPrompt());
+			}
+
+			ImageResponse edited = commonLlm.generateImage(ImageRequest.builder()
+				.provider("openai")
+				.prompt("把背景换成星空")
+				.addImage(ImageInput.fromFile(Path.of("cat.png")))
+				.mask(ImageInput.fromFile(Path.of("mask.png")))
+				.build());
+			Files.write(Path.of("edited.png"), edited.getImages().get(0).getData());
+
+			ImageResponse gemini = commonLlm.generateImage(ImageRequest.builder()
+				.provider("gemini")
+				.prompt("一只橘色的猫坐在窗台上")
+				.aspectRatio("16:9")
+				.imageSize("2K")
+				.build());
+			System.out.println(gemini.getText() + " " + gemini.getUsage());
+		}
+	}
+}
+```
+
+流式：`streamImage` 返回 `ImageStream`（`Iterator<ImageEvent>` 加 `AutoCloseable`），不抛异常。事件类型为 `started`、`partial_image`（只在厂商实际返回部分图片时发出，`getPartialData()` 为部分图片字节）、`image_completed`（`getImageIndex()` 区分第几张）、`usage`（只在厂商返回过用量时发出）、`completed` 与 `error`。流式结果不提供 `rawResponse`。
+```java
+import io.github.charleshyf.commonllm.CommonLlm;
+import io.github.charleshyf.commonllm.core.ImageEvent;
+import io.github.charleshyf.commonllm.core.ImageEventType;
+import io.github.charleshyf.commonllm.core.ImageRequest;
+import io.github.charleshyf.commonllm.core.ImageStream;
+
+public class ImageStreaming {
+
+	public static void main(String[] args) {
+		ImageRequest request = ImageRequest.builder()
+			.provider("openai")
+			.prompt("一只橘色的猫坐在窗台上")
+			.partialImages(2)
+			.build();
+
+		try (CommonLlm commonLlm = CommonLlm.create(); ImageStream stream = commonLlm.streamImage(request)) {
+			while (stream.hasNext()) {
+				ImageEvent event = stream.next();
+
+				if (event.getType() == ImageEventType.PARTIAL_IMAGE) {
+					System.out.println("部分图片 " + event.getPartialIndex() + "：" + event.getPartialData().length + " bytes");
+				} else if (event.getType() == ImageEventType.IMAGE_COMPLETED) {
+					System.out.println("第 " + event.getImageIndex() + " 张完成");
+				} else if (event.getType() == ImageEventType.ERROR) {
+					System.err.println(event.getError());
+				}
+			}
+		}
+	}
+}
+```
+
+多张生成：`imageCount(n)` 对应契约字段 `n`。OpenAI Images API 原生支持 1-10 张，一次请求完成；Responses 路径与 Gemini 不支持原生多张，本库循环调用 n 次，并发数由 `image_concurrency` 控制（默认 1，即串行）。循环中任一次失败则整个调用失败并返回该次错误，未开始的请求不再发出，进行中的请求被中断；结果按调用顺序排列，`usage` 逐项求和，任一次为 `null` 则该项为 `null`。流式时按顺序逐次调用并按图片顺序发出事件，`imageIndex` 跨次连续编号。设置 `includeRawResponse(true)` 时，单次调用的 `getRawResponse()` 为厂商原始响应，库内循环时为各次原始响应组成的列表。
+
+各路径支持的参数（不支持的字段一律报 `SDK_UNSUPPORTED_FEATURE`，不会静默忽略）：
+
+| 参数 | OpenAI Images | OpenAI Responses | Gemini |
+| --- | --- | --- | --- |
+| `images`（图生图） | 是，最多 16 张，不支持 URL | 是，支持 URL | 是，不支持 URL |
+| `mask` | 是 | 是 | 否 |
+| `imageCount` | 原生 1-10 | 库内循环 | 库内循环 |
+| `size` / `quality` / `outputFormat` / `outputCompression` / `background` | 是 | 是 | 否 |
+| `aspectRatio` / `imageSize` | 否 | 否 | 是 |
+| `partialImages`（仅 `streamImage`） | 是 | 是 | 否 |
+| `providerOptions` | additional body properties | additional body properties | `HttpOptions.extraBody` |
+
+`providerOptions` 与已映射字段重名时报 `CONFIG_INVALID`，例如 Images 路径的 `prompt`、`n`、`size`，Responses 路径的 `model`、`input`、`tools`、`tool_choice`，Gemini 的 `contents`、`generationConfig`。Responses 路径多轮修改图片可通过 `putProviderOption("previous_response_id", ...)` 透传。图片客户端复用同一 Provider 的 SDK 客户端，`commonLlm.image("openai").nativeClient()` 与 `commonLlm.model("openai").nativeClient()` 是同一个对象。
+
 ### Coding Agent
 在配置中启用 Agent 并指定工作目录：
 ```yaml
@@ -498,7 +614,11 @@ public class NativeClient {
 | `providers.<实例名>.api_key` | 无 | 启用时必填 |
 | `providers.<实例名>.base_url` | SDK 默认值 | |
 | `providers.<实例名>.default_model` | 无 | 请求未指定 `model` 时使用 |
-| `providers.<实例名>.native_options` | `{}` | 每次请求附加的原生参数；Anthropic 的 `max_tokens` 默认值写在这里 |
+| `providers.<实例名>.native_options` | `{}` | 每次模型请求附加的原生参数；Anthropic 的 `max_tokens` 默认值写在这里；不用于图片生成 |
+| `providers.<实例名>.default_image_model` | 无 | 图片模型；请求未指定 `model` 时使用 |
+| `providers.<实例名>.image_api` | `images` | 仅 `type=openai`：`images` / `responses` |
+| `providers.<实例名>.image_concurrency` | 1 | Responses 与 Gemini 路径 n 大于 1 时的循环并发数 |
+| `providers.<实例名>.image_timeout_seconds` | 继承 `timeout_seconds` | 图片生成单次请求超时 |
 | `agents.<claude_code\|codex>.enabled` | `false` | |
 | `agents.*.auth_mode` | `cli_existing_session` | `api_key` / `cli_existing_session` / `vendor_supported` |
 | `agents.*.api_key` | 无 | `auth_mode=api_key` 时必填 |
@@ -520,6 +640,7 @@ public class NativeClient {
 ## 错误处理
 - `generate` 失败时抛出 `CommonLlmException`（unchecked），`getErrorInfo()` 返回 `ErrorInfo`。
 - `stream` 不抛异常，以唯一的 `error` 终止事件结束，Provider 不存在、配置非法等预检失败也一样。
+- `generateImage` 失败时抛出 `CommonLlmException`；`streamImage` 不抛异常，以唯一的 `error` 终止事件结束。图片生成复用模型调用的错误分类：OpenAI 内容审核拒绝（如 `moderation_blocked`）为不可重试的 `PROVIDER_ERROR`；Gemini 响应中没有图片时为 `PROVIDER_ERROR`，`vendorCode` 为 `finishReason`（如 `IMAGE_SAFETY`）；输入图片无法识别 MIME 类型为 `CONFIG_INVALID`。`image(name)` 对 Anthropic 抛出 `SDK_UNSUPPORTED_FEATURE`。
 - `runAgent` / `AgentClient.run` 不抛异常，返回 `status=failed` 且 `getError()` 非空的 `AgentResult`；`runAgentStream` / `AgentClient.runStream` 以唯一的 `failed` 终止事件结束。CLI 不存在、工作目录非法也走这条路径。
 - `model(name)` / `agent(name)` 对未配置或未启用的实例抛出 `CONFIG_INVALID`。
 
@@ -587,6 +708,9 @@ public class ErrorHandling {
 - Gemini Java SDK 不支持单独设置连接超时，`connect_timeout_seconds` 对 Gemini 不生效；重试次数按 `attempts = max_retries + 1` 映射（`attempts` 含首次请求）。
 - Gemini 的 URL 图片必须带 MIME 类型，`ContentPart.imageUrl` 不带 `mimeType`，本库按扩展名（png / jpg / jpeg / gif / webp）推断，推断不了时报 `CONFIG_INVALID`，此时请改用 `ContentPart.imageBase64`。
 - Chat Completions 的输出上限映射为 `max_completion_tokens`；兼容端点只认 `max_tokens` 时请经 `providerOptions` 传入。
+- Gemini 图片生成不支持蒙版、部分图片（`partialImages`）、指定输出格式与压缩率、`size` / `quality` / `background`，也不支持 URL 输入图片；`google-genai` 2.3.0 的 `ImageConfig` 虽有 `outputMimeType` 等字段，本库按设计不映射。Gemini 不支持原生多张，由库内循环完成。
+- OpenAI Images API 编辑多张图片时，SDK 以同一个 multipart 字段上传图片列表，各图使用第一张图片的 MIME 类型。
+- 图片生成不使用配置中的 `native_options`，厂商原生参数请经请求的 `providerOptions` 传入。
 - Claude Code 走 `claude -p` 子进程，不支持运行中审批回调，中断即结束子进程；本机 `claude -p --help` 没有 `--max-turns` 时，`max_turns` 选项报 `SDK_UNSUPPORTED_FEATURE`。Claude Code 不提供文件变更事件，不发出 `file_changed`。
 - Codex 没有成本数据，`AgentUsage.costUsd` 为 `null`。
 - Java 无法为子进程创建独立进程组，超时或取消时通过 `ProcessHandle.descendants()` 逐个结束子进程及其后代。
@@ -599,6 +723,7 @@ public class ErrorHandling {
 | `CodingAgentExample` | Coding Agent 流式执行与审批处理，参数为 Agent 名（默认 `codex`）与工作目录 |
 | `ProviderSwitchExample` | 同时配置官方 OpenAI 与本地 vLLM 兼容端点并按实例名切换 |
 | `DatabaseConfigProviderExample` | 把配置表映射为 `ConfigProvider` 并演示 `reload()` |
+| `ImageGenerationExample` | 文生图并把图片保存到文件，参数为 Provider 实例名（默认 `openai`）与输出目录（默认 `generated-images`） |
 
 先安装库，再编译示例并导出运行时类路径：
 ```bash
