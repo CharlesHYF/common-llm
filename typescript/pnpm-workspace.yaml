@@ -1,0 +1,6 @@
+# 声明允许执行安装脚本的依赖
+# 创建日期：2026-11-16
+# 修改日期：2026-11-16
+allowBuilds:
+  esbuild: true
+  protobufjs: false

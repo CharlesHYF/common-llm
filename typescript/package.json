@@ -1,0 +1,49 @@
+{
+  "name": "@charleshyf/common-llm",
+  "version": "1.0.0",
+  "description": "Unified Node.js client for model APIs and coding agents",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/types/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/types-cjs/index.d.ts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "common-llm.example.yaml"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc -p tsconfig.examples.json",
+    "build": "tsup"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.325",
+    "@anthropic-ai/sdk": "1.8.0",
+    "@google/genai": "3.3.0",
+    "@openai/codex-sdk": "0.169.0",
+    "openai": "7.57.0",
+    "yaml": "2.9.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "tsup": "9.0.0",
+    "typescript": "7.0.2"
+  }
+}
