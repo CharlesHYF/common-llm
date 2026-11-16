@@ -12,9 +12,15 @@ export {
 	ERROR_CATEGORIES,
 	isCommonLlmError,
 } from "./errors.js";
+export {
+	createImageInputFromBytes,
+	createImageInputFromFile,
+	serializeImageEvent,
+	serializeImageResponse,
+} from "./image-support.js";
 export { redactObject, redactText, REDACTED_VALUE } from "./redaction.js";
 
-export type { AgentClient, ModelClient } from "./clients.js";
+export type { AgentClient, ImageClient, ModelClient } from "./clients.js";
 export type { ErrorCategory, ErrorInfo, ErrorOptions } from "./errors.js";
 export type {
 	AgentCapability,
@@ -37,6 +43,11 @@ export type {
 	FileChange,
 	FileChangeKind,
 	FinishReason,
+	GeneratedImage,
+	ImageEvent,
+	ImageInput,
+	ImageRequest,
+	ImageResponse,
 	ImagePart,
 	Message,
 	MessageRole,

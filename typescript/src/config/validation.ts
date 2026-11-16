@@ -97,6 +97,23 @@ const PROVIDER_RULES: Record<string, FieldRule> = {
 	native_options: {
 		kind: "object",
 	},
+	default_image_model: {
+		kind: "string",
+	},
+	image_api: {
+		kind: "enum",
+		values: [
+			"images",
+
+			"responses",
+		],
+	},
+	image_concurrency: {
+		kind: "positive_integer",
+	},
+	image_timeout_seconds: {
+		kind: "positive_number",
+	},
 };
 
 const AGENT_RULES: Record<string, FieldRule> = {
@@ -402,6 +419,12 @@ export function validateResolvedConfig(config: CommonLlmConfig, missing: Missing
 
 		if (provider.type !== "openai" && provider.api !== "responses") {
 			throw createError("CONFIG_INVALID", `providers.${instanceName}.api 只适用于 type=openai`, {
+				provider: instanceName,
+			});
+		}
+
+		if (provider.type !== "openai" && provider.image_api !== "images") {
+			throw createError("CONFIG_INVALID", `providers.${instanceName}.image_api 只适用于 type=openai`, {
 				provider: instanceName,
 			});
 		}

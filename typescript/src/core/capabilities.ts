@@ -16,6 +16,16 @@ export const PROVIDER_FEATURES: readonly ProviderFeature[] = [
 	"vision",
 
 	"reasoning",
+
+	"image_generation",
+
+	"image_edit",
+
+	"image_mask",
+
+	"image_streaming",
+
+	"image_multiple",
 ];
 
 export const AGENT_FEATURES: readonly AgentFeature[] = [

@@ -19,6 +19,7 @@ import type {
 export const DEFAULT_TIMEOUT_SECONDS = 120;
 export const DEFAULT_CONNECT_TIMEOUT_SECONDS = 10;
 export const DEFAULT_MAX_RETRIES = 2;
+export const DEFAULT_IMAGE_CONCURRENCY = 1;
 export const DEFAULT_LOG_LEVEL: LogLevel = "INFO";
 export const DEFAULT_AGENT_TIMEOUT_SECONDS = 600;
 export const DEFAULT_PERMISSION_MODE = "default";
@@ -71,15 +72,19 @@ function applyProviderDefaults(instanceName: string, input: ProviderConfigInput,
 		providerType = instanceName as ProviderType;
 	}
 
+	const timeoutSeconds = input.timeout_seconds ?? common.timeout_seconds;
 	const provider: ProviderConfig = {
 		type: providerType ?? ("" as ProviderType),
 		api: input.api ?? "responses",
 		enabled: input.enabled ?? false,
-		timeout_seconds: input.timeout_seconds ?? common.timeout_seconds,
+		timeout_seconds: timeoutSeconds,
 		max_retries: input.max_retries ?? common.max_retries,
 		native_options: {
 			...input.native_options,
 		},
+		image_api: input.image_api ?? "images",
+		image_concurrency: input.image_concurrency ?? DEFAULT_IMAGE_CONCURRENCY,
+		image_timeout_seconds: input.image_timeout_seconds ?? timeoutSeconds,
 	};
 
 	if (input.api_key !== undefined) {
@@ -92,6 +97,10 @@ function applyProviderDefaults(instanceName: string, input: ProviderConfigInput,
 
 	if (input.default_model !== undefined && input.default_model !== "") {
 		provider.default_model = input.default_model;
+	}
+
+	if (input.default_image_model !== undefined && input.default_image_model !== "") {
+		provider.default_image_model = input.default_image_model;
 	}
 
 	return provider;

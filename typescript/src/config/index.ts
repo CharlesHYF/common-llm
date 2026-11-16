@@ -25,6 +25,7 @@ export type {
 	CommonLlmConfig,
 	CommonLlmConfigInput,
 	OpenAiApi,
+	OpenAiImageApi,
 	ProviderConfig,
 	ProviderConfigInput,
 	ProviderType,

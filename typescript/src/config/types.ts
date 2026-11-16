@@ -11,6 +11,8 @@ export type ProviderType = "openai" | "anthropic" | "gemini";
 
 export type OpenAiApi = "responses" | "chat_completions";
 
+export type OpenAiImageApi = "images" | "responses";
+
 export type AuthMode = "api_key" | "cli_existing_session" | "vendor_supported";
 
 export interface CommonConfig {
@@ -30,6 +32,10 @@ export interface ProviderConfig {
 	timeout_seconds: number;
 	max_retries: number;
 	native_options: Record<string, unknown>;
+	default_image_model?: string;
+	image_api: OpenAiImageApi;
+	image_concurrency: number;
+	image_timeout_seconds: number;
 }
 
 export interface AgentConfig {

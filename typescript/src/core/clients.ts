@@ -15,6 +15,9 @@ import type {
 	AgentResult,
 	AgentRunOptions,
 	CallOptions,
+	ImageEvent,
+	ImageRequest,
+	ImageResponse,
 	ModelEvent,
 	ModelRequest,
 	ModelResponse,
@@ -39,6 +42,16 @@ export interface ModelClient {
 	readonly provider: string;
 	generate(request: ModelRequest, options?: CallOptions): Promise<ModelResponse>;
 	stream(request: ModelRequest, options?: CallOptions): AsyncIterable<ModelEvent>;
+	supports(feature: string): boolean;
+	capability(): ProviderCapability;
+	nativeClient(): unknown;
+	close(): Promise<void>;
+}
+
+export interface ImageClient {
+	readonly provider: string;
+	generate(request: ImageRequest, options?: CallOptions): Promise<ImageResponse>;
+	stream(request: ImageRequest, options?: CallOptions): AsyncIterable<ImageEvent>;
 	supports(feature: string): boolean;
 	capability(): ProviderCapability;
 	nativeClient(): unknown;

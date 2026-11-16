@@ -314,7 +314,17 @@ export type AgentEvent =
 
 export type AgentEventType = AgentEvent["type"];
 
-export type ProviderFeature = "streaming" | "tool_calls" | "structured_output" | "vision" | "reasoning";
+export type ProviderFeature =
+	| "streaming"
+	| "tool_calls"
+	| "structured_output"
+	| "vision"
+	| "reasoning"
+	| "image_generation"
+	| "image_edit"
+	| "image_mask"
+	| "image_streaming"
+	| "image_multiple";
 
 export interface ProviderCapability {
 	provider: string;
@@ -334,6 +344,103 @@ export interface AgentCapability {
 	eventTypes: AgentEventType[];
 	supportedOptions: string[] | null;
 }
+
+export interface ImageInput {
+	base64?: string;
+	mimeType?: string;
+	url?: string;
+}
+
+export interface ImageRequest {
+	provider: string;
+	model?: string | null;
+	prompt: string;
+	images?: ImageInput[] | null;
+	mask?: ImageInput | null;
+	n?: number | null;
+	size?: string | null;
+	aspectRatio?: string | null;
+	imageSize?: string | null;
+	quality?: string | null;
+	outputFormat?: string | null;
+	outputCompression?: number | null;
+	background?: string | null;
+	partialImages?: number | null;
+	providerOptions?: Record<string, unknown> | null;
+	timeoutSeconds?: number | null;
+	includeRawResponse?: boolean | null;
+	traceId?: string | null;
+	requestId?: string | null;
+	metadata?: Record<string, string> | null;
+}
+
+export interface GeneratedImage {
+	data: Uint8Array;
+	mimeType: string;
+	url: string | null;
+	revisedPrompt: string | null;
+}
+
+export interface ImageResponse {
+	provider: string;
+	model: string | null;
+	id: string | null;
+	images: GeneratedImage[];
+	text: string;
+	usage: Usage;
+	traceId: string;
+	requestId: string | null;
+	rawResponse?: Record<string, unknown> | Record<string, unknown>[] | null;
+}
+
+interface ImageEventBase {
+	traceId: string;
+	sequence: number;
+	provider: string;
+}
+
+export interface ImageStartedEvent extends ImageEventBase {
+	type: "started";
+	model: string | null;
+	id: string | null;
+}
+
+export interface ImagePartialEvent extends ImageEventBase {
+	type: "partial_image";
+	imageIndex: number;
+	partialIndex: number;
+	data: Uint8Array;
+	mimeType: string;
+}
+
+export interface ImageCompletedItemEvent extends ImageEventBase {
+	type: "image_completed";
+	imageIndex: number;
+	image: GeneratedImage;
+}
+
+export interface ImageUsageEvent extends ImageEventBase {
+	type: "usage";
+	usage: Usage;
+}
+
+export interface ImageCompletedEvent extends ImageEventBase {
+	type: "completed";
+	response: ImageResponse;
+}
+
+export interface ImageErrorEvent extends ImageEventBase {
+	type: "error";
+	error: ErrorInfo;
+}
+
+export type ImageEvent =
+	| ImageStartedEvent
+	| ImagePartialEvent
+	| ImageCompletedItemEvent
+	| ImageUsageEvent
+	| ImageCompletedEvent
+	| ImageErrorEvent;
 
 export interface CallOptions {
 	signal?: AbortSignal;
